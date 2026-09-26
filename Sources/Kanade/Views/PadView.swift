@@ -26,7 +26,7 @@ struct PadView: View {
     var body: some View {
         let pad = store.pad(index)
         let _ = store.liveTick
-        let capturing = pad != nil && store.capturingPadID == pad?.id
+        let capturing = pad != nil && (store.capturingPadID == pad?.id || store.midiLearn == .pad(pad!.id))
         ZStack {
             if let pad {
                 PadFace(pad: pad, pressed: isDown, hovering: hovering)
@@ -210,6 +210,7 @@ struct PadFace: View {
             if pad.exclusive { Image(systemName: "1.circle") }
             if pad.isTrimmed { Image(systemName: "scissors") }
             if pad.fx.anyOn { Image(systemName: "wand.and.stars") }
+            if pad.midi != nil { Image(systemName: "pianokeys") }
             if let b = pad.channelMode.badge {
                 Text(b).font(.app(9, .heavy))
             }
@@ -340,6 +341,11 @@ struct PadMenu: View {
             }
             if pad.keyCode != nil {
                 Button("清除快捷键") { store.clearKey(id: id) }
+            }
+            let midiTitle: String = pad.midi.map { "重新 MIDI 学习（当前 \($0.shortLabel)）…" } ?? "MIDI 学习…"
+            Button(midiTitle) { store.beginMIDILearn(.pad(id)) }
+            if pad.midi != nil {
+                Button("清除 MIDI") { store.clearMIDI(id: id) }
             }
             Divider()
             Button("更换音频…") { store.requestPanel(for: index, replace: true) }

@@ -135,11 +135,12 @@ struct Pad: Codable, Identifiable, Equatable {
     var channelMode: ChannelMode = .stereo
     var pan: Double = 0
     var fx: FXSettings = FXSettings()
+    var midi: MIDITrigger? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, fileName, originalName, name, colorIndex, keyCode, keyLabel, volume, mode
         case loop, exclusive, fade, duration, nameEdited, tag, startTime, endTime
-        case loopStart, loopEnd, channelMode, pan, fx
+        case loopStart, loopEnd, channelMode, pan, fx, midi
     }
 
     /// 播放范围
@@ -180,6 +181,7 @@ extension Pad {
         channelMode = (try? c.decodeIfPresent(ChannelMode.self, forKey: .channelMode)) ?? .stereo
         pan = (try? c.decodeIfPresent(Double.self, forKey: .pan)) ?? 0
         fx = (try? c.decodeIfPresent(FXSettings.self, forKey: .fx)) ?? FXSettings()
+        midi = try? c.decodeIfPresent(MIDITrigger.self, forKey: .midi)
     }
 }
 
@@ -195,6 +197,54 @@ struct Library: Codable {
     var master: Double = 0.9
     var stopFade: Double = 0.4
     var outputDeviceUID: String? = nil
+    /// 全局操作的 MIDI 映射，键是 GlobalMIDIAction 的 rawValue
+    var midiGlobal: [String: MIDITrigger]? = nil
+}
+
+// MARK: - MIDI
+
+struct MIDITrigger: Codable, Equatable, Hashable {
+    enum Kind: String, Codable { case note, cc }
+    var kind: Kind
+    var channel: UInt8
+    var number: UInt8
+
+    private static let noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    /// 以中央 C（60）为 C3 的命名方式
+    var noteName: String { Self.noteNames[Int(number) % 12] + String(Int(number) / 12 - 2) }
+    var shortLabel: String { kind == .note ? noteName : "CC\(number)" }
+    var label: String {
+        (kind == .note ? "音符 \(noteName)" : "控制器 CC \(number)") + "，通道 \(Int(channel) + 1)"
+    }
+}
+
+enum GlobalMIDIAction: String, CaseIterable, Identifiable, Codable {
+    case stopAll, pauseAll, nextBoard, prevBoard
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .stopAll: return "全部停止（淡出）"
+        case .pauseAll: return "全部暂停 / 继续"
+        case .nextBoard: return "下一页"
+        case .prevBoard: return "上一页"
+        }
+    }
+}
+
+enum MIDILearnTarget: Equatable {
+    case pad(UUID)
+    case global(GlobalMIDIAction)
+}
+
+// MARK: - 备份
+
+struct BackupManifest: Codable {
+    var app: String = "Kanade"
+    var formatVersion: Int = 1
+    var appVersion: String
+    var exported: Date
+    var boards: [Board]
+    var midiGlobal: [String: MIDITrigger]?
 }
 
 // MARK: - 颜色与标签

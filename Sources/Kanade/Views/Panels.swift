@@ -78,6 +78,20 @@ struct PlaybackPanel: View {
                                 .controlSize(.small)
                         }
                     }
+                    Row("MIDI") {
+                        Text(pad.midi?.label ?? "无")
+                            .font(.app(12))
+                            .foregroundColor(pad.midi == nil ? .secondary : .primary)
+                            .lineLimit(1)
+                        Button(store.midiLearn == .pad(padID) ? "请操作设备…" : "学习") {
+                            store.beginMIDILearn(.pad(padID))
+                        }
+                        .controlSize(.small)
+                        if pad.midi != nil {
+                            Button("清除") { store.clearMIDI(id: padID) }
+                                .controlSize(.small)
+                        }
+                    }
                 }
             }
         }
@@ -240,6 +254,11 @@ struct Inspector: View {
             Text("已用 \(store.usedCount) / \(padsPerBoard) 格")
                 .font(.app(11))
                 .foregroundColor(.secondary)
+            HStack {
+                Button("导出这一页…") { store.exportBackup(currentPageOnly: true) }
+                Button("导入备份…") { store.importBackup() }
+            }
+            .controlSize(.small)
             Button("删除这一页…", role: .destructive) { store.requestDeleteBoard(store.lib.active) }
                 .disabled(store.lib.boards.count < 2)
         }
@@ -249,7 +268,7 @@ struct Inspector: View {
                 Text("双击按钮打开波形与音效编辑，可以剪掉开头结尾、设置循环范围、加均衡和混响。")
                 Text("把音频文件拖到空格上即可添加，拖动按钮可以交换位置，键位跟着位置走。")
                 Text("更改快捷键时，音乐会移到新键对应的格子，原来在那里的音乐换过来。")
-                Text("任何模式下都可以右键点按钮，快速改颜色、标签和声道。")
+                Text("任何模式下都可以右键点按钮，快速改颜色、标签和声道，或者用“MIDI 学习”绑定 MIDI 设备。")
                 Text("格子是灰色虚线框时表示还在载入，变成彩色就可以播放了。")
                 Text("有多个页面时，Tab 切到下一页，Shift+Tab 切到上一页。")
                 Text("空格键暂停或继续全部；把“再按一次”设成“暂停 / 继续”，按格子的键就能单独暂停。")

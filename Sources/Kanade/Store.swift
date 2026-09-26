@@ -75,9 +75,13 @@ final class Store: ObservableObject {
     @Published var prompt: TextPrompt? = nil
     @Published var promptText = ""
     @Published var pendingDeleteBoard: Int? = nil
+    @Published var midiLearn: MIDILearnTarget? = nil
+    @Published var midiSources: [String] = []
 
     let meter = MeterModel()
     let engine = AudioEngine()
+    let midi = MIDIManager()
+    private var ccState: [UInt16: UInt8] = [:]
     private let audioDir: URL
     private let libraryURL: URL
     private var saveWork: DispatchWorkItem?
@@ -139,6 +143,10 @@ final class Store: ObservableObject {
             }
         }
         loadBoards()
+
+        midi.onMessage = { [weak self] m in self?.handleMIDI(m) }
+        midi.onSourcesChanged = { [weak self] in self?.midiSources = self?.midi.sourceNames ?? [] }
+        midiSources = midi.sourceNames
 
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
@@ -728,6 +736,10 @@ final class Store: ObservableObject {
     private func handleKey(_ e: NSEvent) -> Bool {
         if NSApp.modalWindow != nil { return false }
         if prompt != nil { return false }
+        if midiLearn != nil && e.keyCode == 53 {
+            midiLearn = nil
+            return true
+        }
         let mods = e.modifierFlags.intersection([.command, .control, .option])
 
         if capturingPadID != nil {
@@ -772,6 +784,279 @@ final class Store: ObservableObject {
         }
         // 吞掉其他单键，避免系统提示音
         return !Store.passthrough.contains(e.keyCode)
+    }
+
+    // MARK: MIDI
+
+    private func handleMIDI(_ m: MIDIMessage) {
+        let pressed: Bool
+        switch m.kind {
+        case .note:
+            pressed = m.value > 0
+        case .cc:
+            // 控制器按钮按下时一般发 127、松开发 0：只在越过中点向上时触发一次
+            let key = (UInt16(m.channel) << 8) | UInt16(m.number)
+            let prev = ccState[key] ?? 0
+            ccState[key] = m.value
+            pressed = m.value >= 64 && prev < 64
+        }
+        guard pressed else { return }
+        let t = MIDITrigger(kind: m.kind, channel: m.channel, number: m.number)
+        if let target = midiLearn {
+            assignMIDI(t, to: target)
+            midiLearn = nil
+            return
+        }
+        if prompt != nil { return }
+        if let g = lib.midiGlobal?.first(where: { $0.value == t }), let action = GlobalMIDIAction(rawValue: g.key) {
+            perform(action)
+            return
+        }
+        if let i = pads.firstIndex(where: { $0?.midi == t }) {
+            trigger(index: i)
+        }
+    }
+
+    private func perform(_ a: GlobalMIDIAction) {
+        switch a {
+        case .stopAll: stopAll(hard: false)
+        case .pauseAll: togglePauseAll()
+        case .nextBoard: switchBoard(by: 1)
+        case .prevBoard: switchBoard(by: -1)
+        }
+    }
+
+    func beginMIDILearn(_ target: MIDILearnTarget) {
+        capturingPadID = nil
+        midiLearn = target
+        if midiSources.isEmpty { flash("没有检测到 MIDI 设备，请先连接设备。") }
+    }
+
+    private func assignMIDI(_ t: MIDITrigger, to target: MIDILearnTarget) {
+        switch target {
+        case .pad(let id):
+            guard let loc = locate(id) else { return }
+            let b = loc.board
+            for j in 0..<padsPerBoard where j != loc.index && lib.boards[b].pads[j]?.midi == t {
+                lib.boards[b].pads[j]?.midi = nil
+            }
+            lib.boards[b].pads[loc.index]?.midi = t
+            if let g = lib.midiGlobal { lib.midiGlobal = g.filter { $0.value != t } }
+            if let name = lib.boards[b].pads[loc.index]?.displayName {
+                flash("已把\(t.label)分配给“\(name)”。")
+            }
+        case .global(let a):
+            var g = (lib.midiGlobal ?? [:]).filter { $0.value != t }
+            g[a.rawValue] = t
+            lib.midiGlobal = g
+            for b in lib.boards.indices {
+                for j in 0..<padsPerBoard where lib.boards[b].pads[j]?.midi == t {
+                    lib.boards[b].pads[j]?.midi = nil
+                }
+            }
+            flash("已把\(t.label)分配给“\(a.label)”。")
+        }
+        save()
+    }
+
+    func clearMIDI(id: UUID) {
+        editPad(id: id) { $0.midi = nil }
+    }
+
+    func clearGlobalMIDI() {
+        lib.midiGlobal = nil
+        save()
+    }
+
+    func globalMIDILabel(_ a: GlobalMIDIAction) -> String? {
+        lib.midiGlobal?[a.rawValue]?.shortLabel
+    }
+
+    var midiLearnDescription: String? {
+        guard let target = midiLearn else { return nil }
+        switch target {
+        case .pad(let id):
+            return "在 MIDI 设备上按下要分配给“\(padByID(id)?.displayName ?? "")”的键或按钮"
+        case .global(let a):
+            return "在 MIDI 设备上按下要分配给“\(a.label)”的键或按钮"
+        }
+    }
+
+    // MARK: 备份导入导出
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
+    }
+
+    /// 导出为 zip：包含设置（kanade-backup.json）和用到的全部音频
+    func exportBackup(currentPageOnly: Bool) {
+        saveNow()
+        let boards = currentPageOnly ? [lib.boards[lib.active]] : lib.boards
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        let date = f.string(from: Date())
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.zip]
+        panel.canCreateDirectories = true
+        let pageName = boardName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = currentPageOnly ? "Kanade-\(pageName)-\(date).zip" : "Kanade-备份-\(date).zip"
+        panel.message = currentPageOnly ? "导出当前页（包含音频）" : "导出全部页面（包含音频）"
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+
+        let manifest = BackupManifest(appVersion: appVersion, exported: Date(), boards: boards,
+                                      midiGlobal: currentPageOnly ? nil : lib.midiGlobal)
+        let files = boards.flatMap { $0.pads.compactMap { $0?.fileName } }
+        let dir = audioDir
+        flash("正在导出…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let error = Store.writeBackup(manifest: manifest, files: files, audioDir: dir, to: dest)
+            DispatchQueue.main.async {
+                if let error {
+                    self.flash("导出失败：\(error)")
+                } else {
+                    self.flash("已导出到“\(dest.lastPathComponent)”。")
+                }
+            }
+        }
+    }
+
+    private static func writeBackup(manifest: BackupManifest, files: [String], audioDir: URL, to dest: URL) -> String? {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("kanade-export-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tmp) }
+        let root = tmp.appendingPathComponent("Kanade备份", isDirectory: true)
+        let audioOut = root.appendingPathComponent("Audio", isDirectory: true)
+        do {
+            try fm.createDirectory(at: audioOut, withIntermediateDirectories: true)
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            enc.dateEncodingStrategy = .iso8601
+            try enc.encode(manifest).write(to: root.appendingPathComponent("kanade-backup.json"))
+            for name in Set(files) {
+                let src = audioDir.appendingPathComponent(name)
+                let out = audioOut.appendingPathComponent(name)
+                guard fm.fileExists(atPath: src.path) else { continue }
+                // 优先用硬链接，不占额外空间；失败再复制
+                if (try? fm.linkItem(at: src, to: out)) == nil {
+                    try fm.copyItem(at: src, to: out)
+                }
+            }
+            try? fm.removeItem(at: dest)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            p.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", root.path, dest.path]
+            try p.run()
+            p.waitUntilExit()
+            return p.terminationStatus == 0 ? nil : "压缩文件时出错。"
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    private enum ImportResult {
+        case ok(boards: [Board], midiGlobal: [String: MIDITrigger]?, audioCount: Int)
+        case failed(String)
+    }
+
+    /// 导入备份：作为新页面添加，不会覆盖现有页面
+    func importBackup() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.zip]
+        panel.allowsMultipleSelection = false
+        panel.message = "选择 Kanade 导出的备份文件（.zip）"
+        guard panel.runModal() == .OK, let src = panel.url else { return }
+        let dir = audioDir
+        flash("正在导入…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Store.readBackup(from: src, audioDir: dir)
+            DispatchQueue.main.async {
+                switch result {
+                case .failed(let message):
+                    self.flash(message)
+                case .ok(let boards, let midiGlobal, let audioCount):
+                    guard !boards.isEmpty else {
+                        self.flash("备份里没有可以导入的页面。")
+                        return
+                    }
+                    self.lib.boards.append(contentsOf: boards)
+                    // 全局 MIDI 设置：只补上当前还没设置的项目
+                    if let imported = midiGlobal {
+                        var g = self.lib.midiGlobal ?? [:]
+                        let used = Set(g.values)
+                        for (k, v) in imported where g[k] == nil && !used.contains(v) { g[k] = v }
+                        self.lib.midiGlobal = g
+                    }
+                    self.lib.active = self.lib.boards.count - boards.count
+                    self.selected = nil
+                    self.save()
+                    self.loadBoards()
+                    self.flash("已导入 \(boards.count) 页，共 \(audioCount) 个音频。")
+                }
+            }
+        }
+    }
+
+    private static func readBackup(from src: URL, audioDir: URL) -> ImportResult {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent("kanade-import-\(UUID().uuidString)", isDirectory: true)
+        defer { try? fm.removeItem(at: tmp) }
+        do {
+            try fm.createDirectory(at: tmp, withIntermediateDirectories: true)
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+            p.arguments = ["-x", "-k", src.path, tmp.path]
+            try p.run()
+            p.waitUntilExit()
+            guard p.terminationStatus == 0 else { return .failed("无法解压这个文件。") }
+        } catch {
+            return .failed("无法解压这个文件。")
+        }
+        let files = fm.enumerator(at: tmp, includingPropertiesForKeys: nil)?.compactMap { $0 as? URL } ?? []
+        guard let manifestURL = files.first(where: { $0.lastPathComponent == "kanade-backup.json" }) else {
+            return .failed("这个文件不是 Kanade 的备份。")
+        }
+        let dec = JSONDecoder()
+        dec.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? dec.decode(BackupManifest.self, from: data),
+              manifest.app == "Kanade" else {
+            return .failed("这个文件不是 Kanade 的备份，或者已经损坏。")
+        }
+        let audioIn = manifestURL.deletingLastPathComponent().appendingPathComponent("Audio", isDirectory: true)
+        var boards: [Board] = []
+        var count = 0
+        for var b in manifest.boards {
+            b.id = UUID()
+            var pads = b.pads
+            if pads.count < padsPerBoard { pads += Array(repeating: nil, count: padsPerBoard - pads.count) }
+            if pads.count > padsPerBoard { pads = Array(pads.prefix(padsPerBoard)) }
+            for i in pads.indices {
+                guard var pad = pads[i] else { continue }
+                // 只取文件名本身，防止路径穿越
+                let name = (pad.fileName as NSString).lastPathComponent
+                let srcFile = audioIn.appendingPathComponent(name)
+                guard !name.isEmpty, fm.fileExists(atPath: srcFile.path) else {
+                    pads[i] = nil
+                    continue
+                }
+                let ext = (name as NSString).pathExtension
+                let newName = UUID().uuidString + (ext.isEmpty ? "" : "." + ext)
+                let dest = audioDir.appendingPathComponent(newName)
+                if (try? fm.moveItem(at: srcFile, to: dest)) == nil {
+                    guard (try? fm.copyItem(at: srcFile, to: dest)) != nil else {
+                        pads[i] = nil
+                        continue
+                    }
+                }
+                pad.id = UUID()
+                pad.fileName = newName
+                pads[i] = pad
+                count += 1
+            }
+            b.pads = pads
+            boards.append(b)
+        }
+        return .ok(boards: boards, midiGlobal: manifest.midiGlobal, audioCount: count)
     }
 
     // MARK: 提示

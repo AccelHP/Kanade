@@ -69,7 +69,19 @@ struct ContentView: View {
 
     @ViewBuilder
     private var captureBanner: some View {
-        if let id = store.capturingPadID, let pad = store.padByID(id) {
+        if let text = store.midiLearnDescription {
+            HStack(spacing: 10) {
+                Image(systemName: "pianokeys")
+                Text(text)
+                Text("Esc 取消").foregroundColor(.secondary)
+            }
+            .font(.app(13, .medium))
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(color: .black.opacity(0.2), radius: 10, y: 3)
+            .padding(.top, 72)
+        } else if let id = store.capturingPadID, let pad = store.padByID(id) {
             HStack(spacing: 10) {
                 Image(systemName: "keyboard")
                 Text("为“\(pad.displayName)”按下新的键")
@@ -285,6 +297,14 @@ struct StatusBar: View {
             HStack(spacing: 4) { KeyCap(text: "⇧"); KeyCap(text: "Tab"); Text("上一页") }
             Text("右键点按钮可以看到更多选项")
             Spacer()
+            if !store.midiSources.isEmpty {
+                HStack(spacing: 4) {
+                    Image(systemName: "pianokeys").font(.icon(10))
+                    Text("MIDI \(store.midiSources.count)")
+                }
+                .help("已连接的 MIDI 设备：" + store.midiSources.joined(separator: "、"))
+                Divider().frame(height: 12)
+            }
             Text(summary)
         }
         .font(.app(11))
