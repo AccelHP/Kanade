@@ -5,8 +5,6 @@
 
 当前版本：**3.1**
 
-“奏”（かなで）取自日语“奏でる”，意为演奏。
-
 受经典的 Mac 播控软件 Ambrosia Soundboard 启发，全部代码为重新编写。
 
 > 本项目与 Ambrosia Software 没有任何关联，也未获得其授权或认可。
@@ -133,19 +131,6 @@ Kanade 不会在系统里安装字体或其他文件，以上就是全部内容�
 ```
 
 备份这个文件夹即可备份全部内容。原始音频文件不会被修改。
-
-## 发布新版本（维护者）
-
-1. 修改 `build.sh` 开头的 `VERSION`（版本号）和 `BUILD_NUMBER`（每次加 1）。
-2. 运行发布模式，编译并打包：
-
-   ```bash
-   bash build.sh --release
-   ```
-
-3. 在 GitHub 仓库页面点 **Releases → Draft a new release**，标签填 `v版本号`（例如 `v3.1`），把生成的 `Kanade-版本号-macOS.zip` 拖进附件区域，写好更新说明后发布。
-
-打包文件已被 `.gitignore` 排除，不会被误传进源码仓库。
 
 ## 字体
 
