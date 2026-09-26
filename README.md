@@ -29,6 +29,9 @@
 - 总输出峰值电平表（dBFS），带峰值保持和过载指示
 - 可选择输出设备，与系统音量相互独立
 
+![alt text](image.png)
+![alt text](image-1.png)
+
 ## 系统要求
 
 - macOS 13 Ventura 或更新版本
