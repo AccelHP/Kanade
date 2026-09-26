@@ -1,0 +1,15 @@
+# 编译产物
+.build/
+.swiftpm/
+*.app
+DerivedData/
+xcuserdata/
+
+# 编译时由 build.sh 自动下载的思源黑体（不放进仓库）
+Fonts/
+
+# macOS
+.DS_Store
+
+# 发布用的打包文件
+Kanade-*.zip

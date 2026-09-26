@@ -1,0 +1,787 @@
+import SwiftUI
+import AppKit
+import AVFoundation
+import UniformTypeIdentifiers
+
+/// 总输出峰值表：瞬间上升、每秒回落 20 dB、峰值保持 1.5 秒、过载锁存
+final class MeterModel: ObservableObject {
+    static let floor: Double = -60
+
+    @Published private(set) var level: [Double] = [MeterModel.floor, MeterModel.floor]
+    @Published private(set) var hold: [Double] = [MeterModel.floor, MeterModel.floor]
+    @Published private(set) var clipped = false
+
+    private var holdTime: [TimeInterval] = [0, 0]
+    private var lastTime: TimeInterval = 0
+    private let releasePerSecond = 20.0
+    private let holdSeconds = 1.5
+
+    func update(_ l: Float, _ r: Float) {
+        let now = ProcessInfo.processInfo.systemUptime
+        let dt = lastTime == 0 ? 0 : min(0.25, now - lastTime)
+        lastTime = now
+        var newLevel = level
+        var newHold = hold
+        var clip = false
+        for (i, v) in [l, r].enumerated() {
+            if v >= 0.9999 { clip = true }
+            let db = v > 0 ? max(Self.floor, 20 * log10(Double(v))) : Self.floor
+            // 瞬间上升，按时间匀速回落，最低回到刻度底部（完全熄灭）
+            newLevel[i] = max(db, level[i] - releasePerSecond * dt, Self.floor)
+            if newLevel[i] >= hold[i] {
+                newHold[i] = newLevel[i]
+                holdTime[i] = now
+            } else if now - holdTime[i] > holdSeconds {
+                newHold[i] = max(newLevel[i], hold[i] - releasePerSecond * dt, Self.floor)
+            }
+        }
+        if newLevel != level { level = newLevel }
+        if newHold != hold { hold = newHold }
+        if clip && !clipped { clipped = true }
+    }
+
+    func resetClip() { clipped = false }
+}
+
+struct EditorTarget: Identifiable {
+    let id: UUID
+}
+
+enum TextPrompt {
+    case padName(UUID)
+    case boardName(Int)
+    case tag(UUID)
+
+    var title: String {
+        switch self {
+        case .padName: return "重命名按钮"
+        case .boardName: return "重命名页面"
+        case .tag: return "自定义标签"
+        }
+    }
+}
+
+final class Store: ObservableObject {
+    @Published var lib: Library
+    @Published var editing = false {
+        didSet { if !editing { selected = nil } }
+    }
+    @Published var selected: Int? = nil
+    @Published var capturingPadID: UUID? = nil
+    @Published var liveTick = 0
+    @Published var devices: [OutputDevice] = []
+    @Published var message: String? = nil
+    @Published var editorTarget: EditorTarget? = nil
+    @Published var prompt: TextPrompt? = nil
+    @Published var promptText = ""
+    @Published var pendingDeleteBoard: Int? = nil
+
+    let meter = MeterModel()
+    let engine = AudioEngine()
+    private let audioDir: URL
+    private let libraryURL: URL
+    private var saveWork: DispatchWorkItem?
+    private var monitor: Any?
+    private var msgToken = 0
+    /// 每页最近一次打开的时间，内存不够时先释放最久没打开的页
+    private var boardVisited: [UUID: TimeInterval] = [:]
+
+    /// Esc、[、]、Tab 留给全局操作
+    private static let reserved: Set<UInt16> = [53, 33, 30, 48]
+    /// 没有分配给按钮时照常交给系统的键
+    private static let passthrough: Set<UInt16> = [48, 36, 49, 51, 123, 124, 125, 126]
+
+    init() {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Kanade", isDirectory: true)
+        audioDir = base.appendingPathComponent("Audio", isDirectory: true)
+        libraryURL = base.appendingPathComponent("library.json")
+        try? FileManager.default.createDirectory(at: audioDir, withIntermediateDirectories: true)
+
+        var loaded = Library(boards: [Board(name: "第 1 页")])
+        if let data = try? Data(contentsOf: libraryURL),
+           let decoded = try? JSONDecoder().decode(Library.self, from: data),
+           !decoded.boards.isEmpty {
+            loaded = decoded
+        }
+        var missing = 0
+        for b in loaded.boards.indices {
+            var pads = loaded.boards[b].pads
+            if pads.count < padsPerBoard {
+                pads += Array(repeating: nil, count: padsPerBoard - pads.count)
+            }
+            if pads.count > padsPerBoard { pads = Array(pads.prefix(padsPerBoard)) }
+            for i in pads.indices {
+                if let p = pads[i],
+                   !FileManager.default.fileExists(atPath: audioDir.appendingPathComponent(p.fileName).path) {
+                    pads[i] = nil
+                    missing += 1
+                }
+            }
+            loaded.boards[b].pads = pads
+        }
+        if loaded.active < 0 || loaded.active >= loaded.boards.count { loaded.active = 0 }
+        _lib = Published(initialValue: loaded)
+
+        engine.master = loaded.master
+        engine.onChange = { [weak self] in
+            DispatchQueue.main.async { self?.liveTick &+= 1 }
+        }
+        let meterRef = meter
+        engine.onMeter = { l, r in meterRef.update(l, r) }
+
+        devices = AudioDevices.outputs()
+        if let uid = loaded.outputDeviceUID {
+            if let d = devices.first(where: { $0.uid == uid }) {
+                engine.setOutputDevice(d.deviceID)
+            } else {
+                lib.outputDeviceUID = nil
+            }
+        }
+        loadBoards()
+
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.saveNow()
+        }
+        if missing > 0 { flash("有 \(missing) 个音频文件找不到了，对应的按钮已清空。") }
+    }
+
+    // MARK: 读取
+
+    var pads: [Pad?] { lib.boards[lib.active].pads }
+    var boardName: String {
+        let n = lib.boards[lib.active].name
+        return n.isEmpty ? "未命名页面" : n
+    }
+    var usedCount: Int { pads.compactMap { $0 }.count }
+    var liveCount: Int { engine.liveCount }
+    var pausedCount: Int { engine.pausedCount }
+
+    func pad(_ i: Int) -> Pad? { lib.boards[lib.active].pads[i] }
+
+    /// 空格子加入音频后会得到的默认快捷键（和 assign 里的规则一致）
+    func defaultKeyLabel(for i: Int) -> String? {
+        guard KeyNames.defaults.indices.contains(i) else { return nil }
+        let def = KeyNames.defaults[i]
+        let used = pads.contains { $0?.keyCode == def.code }
+        return used ? nil : def.label
+    }
+
+    func locate(_ id: UUID) -> (board: Int, index: Int)? {
+        for b in lib.boards.indices {
+            if let i = lib.boards[b].pads.firstIndex(where: { $0?.id == id }) { return (b, i) }
+        }
+        return nil
+    }
+
+    func padByID(_ id: UUID) -> Pad? {
+        guard let loc = locate(id) else { return nil }
+        return lib.boards[loc.board].pads[loc.index]
+    }
+
+    func url(for pad: Pad) -> URL { audioDir.appendingPathComponent(pad.fileName) }
+
+    func boardLive(_ b: Int) -> Bool {
+        lib.boards[b].pads.contains { p in
+            if let p { return engine.hasVoices(p.id) }
+            return false
+        }
+    }
+
+    // MARK: 保存
+
+    func save() {
+        saveWork?.cancel()
+        let snapshot = lib
+        let url = libraryURL
+        let work = DispatchWorkItem {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: url, options: .atomic)
+            }
+        }
+        saveWork = work
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.3, execute: work)
+    }
+
+    func saveNow() {
+        saveWork?.cancel()
+        if let data = try? JSONEncoder().encode(lib) {
+            try? data.write(to: libraryURL, options: .atomic)
+        }
+    }
+
+    // MARK: 载入音频
+
+    /// 载入所有页面的音频：当前页优先，其他页在后台依次载入。切换页面时不再释放。
+    func loadBoards() {
+        let active = lib.active
+        boardVisited[lib.boards[active].id] = ProcessInfo.processInfo.systemUptime
+        let current = pads.compactMap { $0 }
+        for p in current { request(p, priority: .veryHigh) }
+        engine.prioritize(current.map { $0.id })
+        for b in lib.boards.indices where b != active {
+            for p in lib.boards[b].pads.compactMap({ $0 }) { request(p, priority: .normal) }
+        }
+    }
+
+    private func request(_ p: Pad, priority: Operation.QueuePriority) {
+        switch engine.status(p.id) {
+        case .ready, .loading:
+            return
+        case .none, .failed:
+            ensureLoaded(p, priority: priority)
+        }
+    }
+
+    func ensureLoaded(_ p: Pad, force: Bool = false, priority: Operation.QueuePriority = .veryHigh) {
+        engine.load(p, url: url(for: p), force: force, priority: priority) { [weak self] ok in
+            guard let self else { return }
+            if ok {
+                if let latest = self.padByID(p.id) {
+                    self.engine.applySettings(latest)
+                    self.engine.preparePlan(latest)
+                }
+                self.enforceMemoryBudget()
+            } else {
+                self.flash("无法载入“\(p.displayName)”。")
+            }
+            self.liveTick &+= 1
+        }
+    }
+
+    /// 已载入的音频超过电脑内存的三分之一时，释放最久没打开的页面（当前页和正在播放的不动）
+    private func enforceMemoryBudget() {
+        let budget = Int64(ProcessInfo.processInfo.physicalMemory / 3)
+        var total = engine.loadedBytes
+        guard total > budget else { return }
+        let activeID = lib.boards[lib.active].id
+        let order = lib.boards
+            .filter { $0.id != activeID }
+            .sorted { (boardVisited[$0.id] ?? 0) < (boardVisited[$1.id] ?? 0) }
+        for b in order {
+            for p in b.pads.compactMap({ $0 }) where engine.isLoaded(p.id) && !engine.hasVoices(p.id) {
+                total -= engine.bytes(p.id)
+                engine.unload(p.id)
+                if total <= budget { return }
+            }
+        }
+    }
+
+    func reload(id: UUID) {
+        guard let p = padByID(id) else { return }
+        ensureLoaded(p, force: true)
+    }
+
+    // MARK: 播放
+
+    func trigger(index i: Int) {
+        guard let p = pad(i) else { return }
+        play(p)
+    }
+
+    func triggerByID(_ id: UUID) {
+        guard let p = padByID(id) else { return }
+        play(p)
+    }
+
+    private func play(_ p: Pad) {
+        guard engine.isLoaded(p.id) else {
+            ensureLoaded(p)
+            flash("“\(p.displayName)”还在载入，请稍等一下。")
+            return
+        }
+        if !engine.trigger(p) { flash("音频输出无法启动，请检查输出设备。") }
+    }
+
+    func stopPad(_ id: UUID) {
+        guard let p = padByID(id) else { return }
+        engine.stop(id, fade: p.fade)
+    }
+
+    func preview(_ id: UUID, from t: Double) {
+        guard let p = padByID(id) else { return }
+        engine.preview(p, from: t)
+    }
+
+    func stopAll(hard: Bool) {
+        engine.stopAll(fade: hard ? 0 : lib.stopFade)
+    }
+
+    func togglePauseAll() { engine.togglePauseAll() }
+    func pausePad(_ id: UUID) { engine.pause(id) }
+    func resumePad(_ id: UUID) { engine.resume(id) }
+
+    /// 鼠标按下按钮
+    func tap(_ i: Int) {
+        if pad(i) == nil {
+            requestPanel(for: i, replace: false)
+            return
+        }
+        if editing {
+            selected = i
+            return
+        }
+        trigger(index: i)
+    }
+
+    func setMaster(_ v: Double) {
+        lib.master = v
+        engine.master = v
+        save()
+    }
+
+    func setDevice(_ uid: String?) {
+        guard uid != lib.outputDeviceUID else { return }
+        lib.outputDeviceUID = uid
+        let dev = uid.flatMap { u in devices.first(where: { $0.uid == u })?.deviceID }
+        engine.setOutputDevice(dev)
+        save()
+    }
+
+    var outputName: String {
+        if let uid = lib.outputDeviceUID, let d = devices.first(where: { $0.uid == uid }) { return d.name }
+        return "系统默认输出"
+    }
+
+    func refreshDevices() {
+        devices = AudioDevices.outputs()
+        if let uid = lib.outputDeviceUID, !devices.contains(where: { $0.uid == uid }) {
+            setDevice(nil)
+            flash("之前选的输出设备不在了，已改回系统默认。")
+        }
+    }
+
+    // MARK: 页面
+
+    func switchBoard(to i: Int) {
+        guard i != lib.active, lib.boards.indices.contains(i) else { return }
+        lib.active = i
+        selected = nil
+        capturingPadID = nil
+        loadBoards()
+        save()
+    }
+
+    func switchBoard(by delta: Int) {
+        let n = lib.boards.count
+        guard n > 1 else { return }
+        switchBoard(to: (lib.active + delta + n) % n)
+    }
+
+    func addBoard() {
+        lib.boards.append(Board(name: "第 \(lib.boards.count + 1) 页"))
+        lib.active = lib.boards.count - 1
+        selected = nil
+        save()
+    }
+
+    func renameBoard(_ b: Int, _ name: String) {
+        guard lib.boards.indices.contains(b) else { return }
+        lib.boards[b].name = name
+        save()
+    }
+
+    func requestDeleteBoard(_ b: Int) {
+        guard lib.boards.count > 1 else {
+            flash("至少要保留一页。")
+            return
+        }
+        pendingDeleteBoard = b
+    }
+
+    func confirmDeleteBoard() {
+        guard let b = pendingDeleteBoard, lib.boards.count > 1, lib.boards.indices.contains(b) else { return }
+        pendingDeleteBoard = nil
+        for p in lib.boards[b].pads.compactMap({ $0 }) {
+            engine.unload(p.id, force: true)
+            try? FileManager.default.removeItem(at: url(for: p))
+        }
+        lib.boards.remove(at: b)
+        if lib.active >= lib.boards.count || lib.active > b { lib.active = max(0, lib.active - 1) }
+        selected = nil
+        loadBoards()
+        save()
+    }
+
+    // MARK: 编辑按钮
+
+    func editPad(board b: Int, index i: Int, _ change: (inout Pad) -> Void) {
+        guard var p = lib.boards[b].pads[i] else { return }
+        let before = p
+        change(&p)
+        guard p != before else { return }
+        lib.boards[b].pads[i] = p
+        engine.applySettings(p)
+        if p.channelMode != before.channelMode {
+            ensureLoaded(p, force: true)
+        } else if PlanKey(p) != PlanKey(before) {
+            engine.preparePlan(p)
+        }
+        save()
+    }
+
+    func editPad(_ i: Int, _ change: (inout Pad) -> Void) {
+        editPad(board: lib.active, index: i, change)
+    }
+
+    func editPad(id: UUID, _ change: (inout Pad) -> Void) {
+        guard let loc = locate(id) else { return }
+        editPad(board: loc.board, index: loc.index, change)
+    }
+
+    func padBinding<T>(_ i: Int, _ kp: WritableKeyPath<Pad, T>, fallback: T) -> Binding<T> {
+        Binding(
+            get: { [weak self] in self?.pad(i)?[keyPath: kp] ?? fallback },
+            set: { [weak self] v in self?.editPad(i) { $0[keyPath: kp] = v } }
+        )
+    }
+
+    func padBinding<T>(id: UUID, _ kp: WritableKeyPath<Pad, T>, fallback: T) -> Binding<T> {
+        Binding(
+            get: { [weak self] in self?.padByID(id)?[keyPath: kp] ?? fallback },
+            set: { [weak self] v in self?.editPad(id: id) { $0[keyPath: kp] = v } }
+        )
+    }
+
+    func padNameBinding(id: UUID) -> Binding<String> {
+        Binding(
+            get: { [weak self] in self?.padByID(id)?.name ?? "" },
+            set: { [weak self] v in self?.editPad(id: id) { $0.name = v; $0.nameEdited = true } }
+        )
+    }
+
+    func setTag(id: UUID, _ tag: String?) {
+        let t = tag?.trimmingCharacters(in: .whitespacesAndNewlines)
+        editPad(id: id) { $0.tag = (t?.isEmpty ?? true) ? nil : t }
+    }
+
+    func clearPad(id: UUID) {
+        guard let loc = locate(id), let p = lib.boards[loc.board].pads[loc.index] else { return }
+        engine.unload(p.id, force: true)
+        try? FileManager.default.removeItem(at: url(for: p))
+        lib.boards[loc.board].pads[loc.index] = nil
+        if loc.board == lib.active && selected == loc.index { selected = nil }
+        if editorTarget?.id == id { editorTarget = nil }
+        save()
+    }
+
+    func swap(_ a: Int, _ b: Int) {
+        guard a != b, (0..<padsPerBoard).contains(a), (0..<padsPerBoard).contains(b) else { return }
+        let board = lib.active
+        lib.boards[board].pads.swapAt(a, b)
+        // 用默认键的格子，移动后换成新位置的默认键
+        retargetDefaultKey(board: board, from: a, to: b)
+        retargetDefaultKey(board: board, from: b, to: a)
+        clearDuplicateKeys(board: board, keep: b)
+        clearDuplicateKeys(board: board, keep: a)
+        if selected == a { selected = b } else if selected == b { selected = a }
+        save()
+    }
+
+    func openEditor(_ i: Int) {
+        guard let p = pad(i) else { return }
+        ensureLoaded(p)
+        editorTarget = EditorTarget(id: p.id)
+    }
+
+    // MARK: 文字输入（重命名 / 自定义标签）
+
+    func beginRename(id: UUID) {
+        guard let p = padByID(id) else { return }
+        promptText = p.name
+        prompt = .padName(id)
+    }
+
+    func beginBoardRename(_ b: Int) {
+        guard lib.boards.indices.contains(b) else { return }
+        promptText = lib.boards[b].name
+        prompt = .boardName(b)
+    }
+
+    func beginTag(id: UUID) {
+        guard let p = padByID(id) else { return }
+        promptText = p.tag ?? ""
+        prompt = .tag(id)
+    }
+
+    func commitPrompt() {
+        guard let p = prompt else { return }
+        let text = promptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch p {
+        case .padName(let id):
+            editPad(id: id) { $0.name = text; $0.nameEdited = true }
+        case .boardName(let b):
+            renameBoard(b, text)
+        case .tag(let id):
+            setTag(id: id, text)
+        }
+        prompt = nil
+    }
+
+    // MARK: 快捷键
+
+    func beginKeyCapture(id: UUID) {
+        capturingPadID = id
+    }
+
+    func clearKey(id: UUID) {
+        editPad(id: id) { $0.keyCode = nil; $0.keyLabel = nil }
+    }
+
+    private func setKey(_ code: UInt16, label: String) {
+        guard let id = capturingPadID, let loc = locate(id) else { return }
+        let b = loc.board
+        let i = loc.index
+        if let t = defaultIndex(for: code), t != i {
+            // 按下的键对应另一个格子：把这个音乐移过去，原来在那里的换到当前位置
+            lib.boards[b].pads.swapAt(i, t)
+            retargetDefaultKey(board: b, from: t, to: i)
+            lib.boards[b].pads[t]?.keyCode = code
+            lib.boards[b].pads[t]?.keyLabel = KeyNames.defaults[t].label
+            clearDuplicateKeys(board: b, keep: t)
+            clearDuplicateKeys(board: b, keep: i)
+            if b == lib.active {
+                if selected == i { selected = t } else if selected == t { selected = i }
+            }
+            if let name = lib.boards[b].pads[t]?.displayName {
+                flash("“\(name)”已移到 \(KeyNames.defaults[t].label) 键的位置。")
+            }
+        } else {
+            // 按下的是当前格子自己的键，或者不属于任何格子的键（如 F1、方向键）：原地设置
+            lib.boards[b].pads[i]?.keyCode = code
+            lib.boards[b].pads[i]?.keyLabel = defaultIndex(for: code).map { KeyNames.defaults[$0].label } ?? label
+            clearDuplicateKeys(board: b, keep: i)
+        }
+        save()
+    }
+
+    private func defaultIndex(for code: UInt16) -> Int? {
+        KeyNames.defaults.firstIndex { $0.code == code }
+    }
+
+    /// 格子从 old 移到 new 后：如果它用的是旧位置的默认键，就换成新位置的默认键
+    private func retargetDefaultKey(board b: Int, from old: Int, to new: Int) {
+        guard KeyNames.defaults.indices.contains(old), KeyNames.defaults.indices.contains(new),
+              var p = lib.boards[b].pads[new] else { return }
+        if p.keyCode == KeyNames.defaults[old].code {
+            p.keyCode = KeyNames.defaults[new].code
+            p.keyLabel = KeyNames.defaults[new].label
+            lib.boards[b].pads[new] = p
+        }
+    }
+
+    /// 同一页里只保留 keep 这一格使用它的键
+    private func clearDuplicateKeys(board b: Int, keep: Int) {
+        guard let code = lib.boards[b].pads[keep]?.keyCode else { return }
+        for j in 0..<padsPerBoard where j != keep && lib.boards[b].pads[j]?.keyCode == code {
+            lib.boards[b].pads[j]?.keyCode = nil
+            lib.boards[b].pads[j]?.keyLabel = nil
+        }
+    }
+
+    // MARK: 添加音频
+
+    func requestPanel(for i: Int, replace: Bool) {
+        DispatchQueue.main.async { self.openPanel(for: i, replace: replace) }
+    }
+
+    private func openPanel(for i: Int, replace: Bool) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = !replace
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.audio]
+        panel.message = replace ? "选择新的音频文件" : "选择音频文件（可以多选）"
+        if panel.runModal() == .OK {
+            addFiles(replace ? Array(panel.urls.prefix(1)) : panel.urls, at: i)
+        }
+    }
+
+    private func isAudio(_ url: URL) -> Bool {
+        if let t = UTType(filenameExtension: url.pathExtension) { return t.conforms(to: .audio) }
+        return false
+    }
+
+    func addFiles(_ urls: [URL], at start: Int) {
+        let files = urls.filter { isAudio($0) }
+        guard !files.isEmpty else {
+            flash("请选择音频文件，比如 MP3、WAV、AIFF 或 M4A。")
+            return
+        }
+        let b = lib.active
+        let current = lib.boards[b].pads
+        var slots = [start]
+        for j in (start + 1)..<padsPerBoard where slots.count < files.count && current[j] == nil {
+            slots.append(j)
+        }
+        for j in 0..<start where slots.count < files.count && current[j] == nil {
+            slots.append(j)
+        }
+        var ok = 0
+        for (k, slot) in slots.enumerated() where assign(files[k], to: slot, board: b) { ok += 1 }
+        if files.count > slots.count {
+            flash("这一页放不下了，有 \(files.count - slots.count) 个文件没有添加。新建一页后再拖进去。")
+        } else if ok > 1 {
+            flash("已添加 \(ok) 个音频。")
+        }
+    }
+
+    @discardableResult
+    private func assign(_ src: URL, to i: Int, board b: Int) -> Bool {
+        let access = src.startAccessingSecurityScopedResource()
+        defer { if access { src.stopAccessingSecurityScopedResource() } }
+
+        let ext = src.pathExtension.lowercased()
+        let stored = UUID().uuidString + (ext.isEmpty ? "" : "." + ext)
+        let dest = audioDir.appendingPathComponent(stored)
+        do {
+            try FileManager.default.copyItem(at: src, to: dest)
+        } catch {
+            flash("复制“\(src.lastPathComponent)”失败。")
+            return false
+        }
+        guard let f = try? AVAudioFile(forReading: dest), f.length > 0 else {
+            try? FileManager.default.removeItem(at: dest)
+            flash("无法读取“\(src.lastPathComponent)”，请换成 MP3、WAV、AIFF 或 M4A。")
+            return false
+        }
+        let duration = Double(f.length) / f.processingFormat.sampleRate
+
+        var pad: Pad
+        if let old = lib.boards[b].pads[i] {
+            engine.unload(old.id, force: true)
+            try? FileManager.default.removeItem(at: audioDir.appendingPathComponent(old.fileName))
+            pad = old
+            pad.fileName = stored
+            pad.originalName = src.lastPathComponent
+            pad.startTime = 0
+            pad.endTime = nil
+            pad.loopStart = nil
+            pad.loopEnd = nil
+        } else {
+            let def = KeyNames.defaults[i]
+            let used = lib.boards[b].pads.contains { $0?.keyCode == def.code }
+            pad = Pad(fileName: stored,
+                      originalName: src.lastPathComponent,
+                      name: "",
+                      colorIndex: i / 8,
+                      keyCode: used ? nil : def.code,
+                      keyLabel: used ? nil : def.label)
+        }
+        pad.duration = duration
+        if !pad.nameEdited { pad.name = src.deletingPathExtension().lastPathComponent }
+        lib.boards[b].pads[i] = pad
+        ensureLoaded(pad, force: true)
+        save()
+        return true
+    }
+
+    /// 处理拖放：Finder 拖来的文件，或编辑模式下拖动按钮交换位置
+    func handleDrop(_ providers: [NSItemProvider], at i: Int) -> Bool {
+        let fileProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        if !fileProviders.isEmpty {
+            var urls = [URL?](repeating: nil, count: fileProviders.count)
+            let lock = NSLock()
+            let group = DispatchGroup()
+            for (k, p) in fileProviders.enumerated() {
+                group.enter()
+                p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    var u: URL?
+                    if let d = item as? Data { u = URL(dataRepresentation: d, relativeTo: nil) }
+                    else if let url = item as? URL { u = url }
+                    lock.lock()
+                    urls[k] = u
+                    lock.unlock()
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { [weak self] in
+                self?.addFiles(urls.compactMap { $0 }, at: i)
+            }
+            return true
+        }
+        if editing, let p = providers.first, p.canLoadObject(ofClass: NSString.self) {
+            _ = p.loadObject(ofClass: NSString.self) { obj, _ in
+                guard let s = obj as? NSString else { return }
+                let str = s as String
+                let prefix = "kanade-pad:"
+                guard str.hasPrefix(prefix), let from = Int(str.dropFirst(prefix.count)) else { return }
+                DispatchQueue.main.async { [weak self] in self?.swap(from, i) }
+            }
+            return true
+        }
+        return false
+    }
+
+    // MARK: 键盘
+
+    func installKeyMonitor() {
+        guard monitor == nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self else { return e }
+            return self.handleKey(e) ? nil : e
+        }
+    }
+
+    private func handleKey(_ e: NSEvent) -> Bool {
+        if NSApp.modalWindow != nil { return false }
+        if prompt != nil { return false }
+        let mods = e.modifierFlags.intersection([.command, .control, .option])
+
+        if capturingPadID != nil {
+            if e.keyCode == 53 { capturingPadID = nil; return true }
+            if !mods.isEmpty { return false }
+            if Store.reserved.contains(e.keyCode) {
+                flash("这个键留给了全局操作，请换一个。")
+                return true
+            }
+            setKey(e.keyCode, label: KeyNames.label(for: e))
+            capturingPadID = nil
+            return true
+        }
+
+        if editorTarget != nil { return false }
+        if let r = NSApp.keyWindow?.firstResponder, r is NSText {
+            // 编辑模式下正在输入文字时不抢按键；演出模式下一律把按键交给按钮
+            if editing { return false }
+            NSApp.keyWindow?.makeFirstResponder(nil)
+        }
+        if !mods.isEmpty { return false }
+
+        switch e.keyCode {
+        case 53: stopAll(hard: e.modifierFlags.contains(.shift)); return true
+        case 33: switchBoard(by: -1); return true
+        case 30: switchBoard(by: 1); return true
+        case 48:
+            // Tab 下一页，Shift+Tab 上一页（到头后循环）
+            if !e.isARepeat { switchBoard(by: e.modifierFlags.contains(.shift) ? -1 : 1) }
+            return true
+        default: break
+        }
+
+        if let i = pads.firstIndex(where: { $0?.keyCode == e.keyCode }) {
+            if !e.isARepeat { trigger(index: i) }
+            return true
+        }
+        // 空格没有分配给格子时：暂停 / 继续全部
+        if e.keyCode == 49 {
+            if !e.isARepeat { togglePauseAll() }
+            return true
+        }
+        // 吞掉其他单键，避免系统提示音
+        return !Store.passthrough.contains(e.keyCode)
+    }
+
+    // MARK: 提示
+
+    func flash(_ text: String) {
+        message = text
+        msgToken += 1
+        let token = msgToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5) { [weak self] in
+            if self?.msgToken == token { self?.message = nil }
+        }
+    }
+}
