@@ -460,3 +460,71 @@ struct AppMark: View {
         .accessibilityHidden(true)
     }
 }
+
+// MARK: - 即时点击
+
+/// 播放模式下的鼠标点击：用 AppKit 的 mouseDown，按下的瞬间立刻触发，不经过 SwiftUI 的手势判断。
+/// 右键和 Control+单击会穿透到下面，让右键菜单照常工作。
+struct ClickCatcher: NSViewRepresentable {
+    var onDown: () -> Void
+    var onUp: () -> Void
+
+    func makeNSView(context: Context) -> CatcherView {
+        let v = CatcherView()
+        v.onDown = onDown
+        v.onUp = onUp
+        return v
+    }
+
+    func updateNSView(_ v: CatcherView, context: Context) {
+        v.onDown = onDown
+        v.onUp = onUp
+    }
+
+    final class CatcherView: NSView {
+        var onDown: (() -> Void)?
+        var onUp: (() -> Void)?
+
+        /// 窗口不在前台时，第一下点击也直接触发
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            if let e = NSApp.currentEvent {
+                let isRight = e.type == .rightMouseDown || e.type == .rightMouseUp || e.type == .rightMouseDragged
+                let isControlClick = (e.type == .leftMouseDown || e.type == .leftMouseUp)
+                    && e.modifierFlags.contains(.control)
+                if isRight || isControlClick { return nil }
+            }
+            return super.hitTest(point)
+        }
+
+        override func mouseDown(with event: NSEvent) { onDown?() }
+        override func mouseUp(with event: NSEvent) { onUp?() }
+    }
+}
+
+// MARK: - 取得所在的窗口
+
+/// 把 SwiftUI 视图所在的 NSWindow 回传出来（用来判断按键发生在哪个窗口）
+struct WindowAccessor: NSViewRepresentable {
+    var onWindow: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> AccessorView {
+        let v = AccessorView()
+        v.onWindow = onWindow
+        return v
+    }
+
+    func updateNSView(_ v: AccessorView, context: Context) {
+        v.onWindow = onWindow
+    }
+
+    final class AccessorView: NSView {
+        var onWindow: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let w = window
+            DispatchQueue.main.async { [weak self] in self?.onWindow?(w) }
+        }
+    }
+}

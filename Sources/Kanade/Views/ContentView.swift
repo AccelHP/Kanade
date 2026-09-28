@@ -48,6 +48,7 @@ struct ContentView: View {
         } message: {
             Text("这一页上的音频会一起从 Kanade 中删除，你电脑上的原文件不受影响。")
         }
+        .background(WindowAccessor { w in store.mainWindow = w })
         .onAppear { store.installKeyMonitor() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             store.refreshDevices()
@@ -236,7 +237,7 @@ struct BoardTabs: View {
                     } label: {
                         HStack(spacing: 6) {
                             if live { Circle().fill(Color.red).frame(width: 6, height: 6) }
-                            Text(b.name.isEmpty ? "未命名页面" : b.name)
+                            Text(store.boardDisplayName(i))
                                 .font(.app(13, selected ? .semibold : .regular))
                         }
                         .foregroundColor(selected ? .primary : .secondary)

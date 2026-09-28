@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVFoundation
 import UniformTypeIdentifiers
+import Combine
 
 /// 总输出峰值表：瞬间上升、每秒回落 20 dB、峰值保持 1.5 秒、过载锁存
 final class MeterModel: ObservableObject {
@@ -13,6 +14,8 @@ final class MeterModel: ObservableObject {
 
     private var holdTime: [TimeInterval] = [0, 0]
     private var lastTime: TimeInterval = 0
+    private var clipTime: TimeInterval = 0
+    var clipMode: ClipHoldMode = .manual
     private let releasePerSecond = 20.0
     private let holdSeconds = 1.5
 
@@ -37,7 +40,17 @@ final class MeterModel: ObservableObject {
         }
         if newLevel != level { level = newLevel }
         if newHold != hold { hold = newHold }
-        if clip && !clipped { clipped = true }
+        if clip { clipTime = now }
+        let want: Bool
+        switch clipMode {
+        case .manual:
+            want = clipped || clip
+        case .auto3s:
+            want = clip || (clipped && now - clipTime < 3)
+        case .none:
+            want = now - clipTime < 0.15
+        }
+        if want != clipped { clipped = want }
     }
 
     func resetClip() { clipped = false }
@@ -72,7 +85,13 @@ final class Store: ObservableObject {
     @Published var devices: [OutputDevice] = []
     @Published var message: String? = nil
     @Published var editorTarget: EditorTarget? = nil
-    @Published var prompt: TextPrompt? = nil
+    @Published var prompt: TextPrompt? = nil {
+        didSet {
+            if (oldValue == nil) != (prompt == nil) {
+                if prompt != nil { spaceKey.suspend() } else { spaceKey.resume() }
+            }
+        }
+    }
     @Published var promptText = ""
     @Published var pendingDeleteBoard: Int? = nil
     @Published var midiLearn: MIDILearnTarget? = nil
@@ -81,7 +100,15 @@ final class Store: ObservableObject {
     let meter = MeterModel()
     let engine = AudioEngine()
     let midi = MIDIManager()
+    let settings = AppSettings()
+    let spaceKey = SpaceHotKey()
+    /// 主窗口（用来判断按键发生在哪个窗口）
+    weak var mainWindow: NSWindow?
+    /// 刚刚移动过的格子，外边框闪烁提示
+    @Published var flashIDs: Set<UUID> = []
+    private var settingsObserver: AnyCancellable?
     private var ccState: [UInt16: UInt8] = [:]
+    private var tickPending = false
     private let audioDir: URL
     private let libraryURL: URL
     private var saveWork: DispatchWorkItem?
@@ -128,8 +155,14 @@ final class Store: ObservableObject {
         _lib = Published(initialValue: loaded)
 
         engine.master = loaded.master
+        // 一次操作里的多次状态变化合并成一次界面刷新
         engine.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.liveTick &+= 1 }
+            guard let self, !self.tickPending else { return }
+            self.tickPending = true
+            DispatchQueue.main.async {
+                self.tickPending = false
+                self.liveTick &+= 1
+            }
         }
         let meterRef = meter
         engine.onMeter = { l, r in meterRef.update(l, r) }
@@ -143,6 +176,32 @@ final class Store: ObservableObject {
             }
         }
         loadBoards()
+
+        // 键位固定在格子上：旧数据里的自定义键、被清除的键一律恢复成所在位置的默认键
+        for b in lib.boards.indices { normalizeKeys(board: b) }
+
+        // 个性化设置变化时刷新界面
+        settingsObserver = settings.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.meter.clipMode = self.settings.clipHold
+                self.objectWillChange.send()
+            }
+        }
+        meter.clipMode = settings.clipHold
+        settings.applyTheme()
+
+        // Kanade 内部全局的空格键
+        SpaceHotKey.onPress = { [weak self] in self?.handleSpace() }
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.spaceKey.setActive(true)
+        }
+        NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.spaceKey.setActive(false)
+        }
+        if NSApp.isActive { spaceKey.setActive(true) }
 
         midi.onMessage = { [weak self] m in self?.handleMIDI(m) }
         midi.onSourcesChanged = { [weak self] in self?.midiSources = self?.midi.sourceNames ?? [] }
@@ -158,9 +217,12 @@ final class Store: ObservableObject {
     // MARK: 读取
 
     var pads: [Pad?] { lib.boards[lib.active].pads }
-    var boardName: String {
-        let n = lib.boards[lib.active].name
-        return n.isEmpty ? "未命名页面" : n
+    var boardName: String { boardDisplayName(lib.active) }
+
+    /// 页面显示名：没改过名字的按当前位置自动编号（删掉前面的页，后面的自动前推）
+    func boardDisplayName(_ i: Int) -> String {
+        guard lib.boards.indices.contains(i) else { return "" }
+        return lib.boards[i].hasDefaultName ? "第 \(i + 1) 页" : lib.boards[i].name
     }
     var usedCount: Int { pads.compactMap { $0 }.count }
     var liveCount: Int { engine.liveCount }
@@ -168,12 +230,10 @@ final class Store: ObservableObject {
 
     func pad(_ i: Int) -> Pad? { lib.boards[lib.active].pads[i] }
 
-    /// 空格子加入音频后会得到的默认快捷键（和 assign 里的规则一致）
+    /// 格子对应的键位（固定不变）
     func defaultKeyLabel(for i: Int) -> String? {
         guard KeyNames.defaults.indices.contains(i) else { return nil }
-        let def = KeyNames.defaults[i]
-        let used = pads.contains { $0?.keyCode == def.code }
-        return used ? nil : def.label
+        return KeyNames.defaults[i].label
     }
 
     func locate(_ id: UUID) -> (board: Int, index: Int)? {
@@ -313,7 +373,7 @@ final class Store: ObservableObject {
     }
 
     func stopAll(hard: Bool) {
-        engine.stopAll(fade: hard ? 0 : lib.stopFade)
+        engine.stopAll(fade: hard ? 0 : settings.stopFade)
     }
 
     func togglePauseAll() { engine.togglePauseAll() }
@@ -378,7 +438,7 @@ final class Store: ObservableObject {
     }
 
     func addBoard() {
-        lib.boards.append(Board(name: "第 \(lib.boards.count + 1) 页"))
+        lib.boards.append(Board(name: ""))
         lib.active = lib.boards.count - 1
         selected = nil
         save()
@@ -459,6 +519,42 @@ final class Store: ObservableObject {
         )
     }
 
+    /// 批量设置当前页的“再按一次”；shortOnly 为 true 时只改 15 秒以内的格子
+    func setModeForBoard(_ mode: PressMode, shortOnly: Bool) {
+        let b = lib.active
+        var n = 0
+        for i in 0..<padsPerBoard {
+            guard let p = lib.boards[b].pads[i] else { continue }
+            if shortOnly && p.duration >= 15 { continue }
+            if p.mode != mode {
+                lib.boards[b].pads[i]?.mode = mode
+                n += 1
+            }
+        }
+        save()
+        flash(n > 0 ? "已修改 \(n) 个格子。" : "没有需要修改的格子。")
+    }
+
+    /// 自动增益：把峰值放大到 −1 dBFS（最多 +18 dB）
+    func autoGain(id: UUID) {
+        guard let peaks = engine.peaks(id) else {
+            flash("音频还在载入，请稍后再试。")
+            return
+        }
+        let peak = max(peaks.left.max() ?? 0, peaks.right.max() ?? 0)
+        guard peak > 0.00001 else {
+            flash("这段音频几乎没有声音。")
+            return
+        }
+        let gain = min(18, max(0, -1 - 20 * log10(Double(peak))))
+        editPad(id: id) { $0.gainDB = (gain * 2).rounded() / 2 }
+        if gain < 0.25 {
+            flash("这段音频已经接近满格，不需要再放大。")
+        } else {
+            flash(String(format: "已放大 %.1f dB。", gain))
+        }
+    }
+
     func setTag(id: UUID, _ tag: String?) {
         let t = tag?.trimmingCharacters(in: .whitespacesAndNewlines)
         editPad(id: id) { $0.tag = (t?.isEmpty ?? true) ? nil : t }
@@ -476,21 +572,56 @@ final class Store: ObservableObject {
 
     func swap(_ a: Int, _ b: Int) {
         guard a != b, (0..<padsPerBoard).contains(a), (0..<padsPerBoard).contains(b) else { return }
-        let board = lib.active
-        lib.boards[board].pads.swapAt(a, b)
-        // 用默认键的格子，移动后换成新位置的默认键
-        retargetDefaultKey(board: board, from: a, to: b)
-        retargetDefaultKey(board: board, from: b, to: a)
-        clearDuplicateKeys(board: board, keep: b)
-        clearDuplicateKeys(board: board, keep: a)
+        movePads(board: lib.active, a, b)
         if selected == a { selected = b } else if selected == b { selected = a }
         save()
+    }
+
+    /// 互换两个格子里的音频：键位留在格子上，颜色跟着行走，并闪烁提示
+    private func movePads(board bd: Int, _ a: Int, _ b: Int) {
+        lib.boards[bd].pads.swapAt(a, b)
+        retargetColor(board: bd, from: a, to: b)
+        retargetColor(board: bd, from: b, to: a)
+        normalizeKeys(board: bd)
+        let ids = [lib.boards[bd].pads[a]?.id, lib.boards[bd].pads[b]?.id].compactMap { $0 }
+        flashMoved(ids)
+    }
+
+    /// 用的是原来那一行默认颜色的，换成新一行的默认颜色；手动改过颜色的保持不变
+    private func retargetColor(board bd: Int, from old: Int, to new: Int) {
+        guard var p = lib.boards[bd].pads[new] else { return }
+        if paletteIndex(p.colorIndex) == old / 8 {
+            p.colorIndex = new / 8
+            lib.boards[bd].pads[new] = p
+        }
+    }
+
+    /// 让每个格子的键位都等于它所在位置的默认键
+    private func normalizeKeys(board bd: Int) {
+        for i in 0..<min(padsPerBoard, lib.boards[bd].pads.count) where lib.boards[bd].pads[i] != nil {
+            let def = KeyNames.defaults[i]
+            if lib.boards[bd].pads[i]?.keyCode != def.code || lib.boards[bd].pads[i]?.keyLabel != def.label {
+                lib.boards[bd].pads[i]?.keyCode = def.code
+                lib.boards[bd].pads[i]?.keyLabel = def.label
+            }
+        }
+    }
+
+    private func flashMoved(_ ids: [UUID]) {
+        guard !ids.isEmpty else { return }
+        flashIDs.formUnion(ids)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            self?.flashIDs.subtract(ids)
+        }
     }
 
     func openEditor(_ i: Int) {
         guard let p = pad(i) else { return }
         ensureLoaded(p)
         editorTarget = EditorTarget(id: p.id)
+        if settings.editorAutoPlay && engine.isLoaded(p.id) && !engine.hasVoices(p.id) {
+            trigger(index: i)
+        }
     }
 
     // MARK: 文字输入（重命名 / 自定义标签）
@@ -503,7 +634,7 @@ final class Store: ObservableObject {
 
     func beginBoardRename(_ b: Int) {
         guard lib.boards.indices.contains(b) else { return }
-        promptText = lib.boards[b].name
+        promptText = lib.boards[b].hasDefaultName ? "" : lib.boards[b].name
         prompt = .boardName(b)
     }
 
@@ -527,65 +658,34 @@ final class Store: ObservableObject {
         prompt = nil
     }
 
-    // MARK: 快捷键
+    // MARK: 移动到其他键位（键位固定在格子上，移动的是音频）
 
     func beginKeyCapture(id: UUID) {
+        midiLearn = nil
         capturingPadID = id
-    }
-
-    func clearKey(id: UUID) {
-        editPad(id: id) { $0.keyCode = nil; $0.keyLabel = nil }
     }
 
     private func setKey(_ code: UInt16, label: String) {
         guard let id = capturingPadID, let loc = locate(id) else { return }
+        guard let t = defaultIndex(for: code) else {
+            flash("只能移动到格子对应的键位上。")
+            return
+        }
         let b = loc.board
         let i = loc.index
-        if let t = defaultIndex(for: code), t != i {
-            // 按下的键对应另一个格子：把这个音乐移过去，原来在那里的换到当前位置
-            lib.boards[b].pads.swapAt(i, t)
-            retargetDefaultKey(board: b, from: t, to: i)
-            lib.boards[b].pads[t]?.keyCode = code
-            lib.boards[b].pads[t]?.keyLabel = KeyNames.defaults[t].label
-            clearDuplicateKeys(board: b, keep: t)
-            clearDuplicateKeys(board: b, keep: i)
-            if b == lib.active {
-                if selected == i { selected = t } else if selected == t { selected = i }
-            }
-            if let name = lib.boards[b].pads[t]?.displayName {
-                flash("“\(name)”已移到 \(KeyNames.defaults[t].label) 键的位置。")
-            }
-        } else {
-            // 按下的是当前格子自己的键，或者不属于任何格子的键（如 F1、方向键）：原地设置
-            lib.boards[b].pads[i]?.keyCode = code
-            lib.boards[b].pads[i]?.keyLabel = defaultIndex(for: code).map { KeyNames.defaults[$0].label } ?? label
-            clearDuplicateKeys(board: b, keep: i)
+        guard t != i else { return }
+        movePads(board: b, i, t)
+        if b == lib.active {
+            if selected == i { selected = t } else if selected == t { selected = i }
+        }
+        if let name = lib.boards[b].pads[t]?.displayName {
+            flash("“\(name)”已移到 \(KeyNames.defaults[t].label) 键的位置。")
         }
         save()
     }
 
     private func defaultIndex(for code: UInt16) -> Int? {
         KeyNames.defaults.firstIndex { $0.code == code }
-    }
-
-    /// 格子从 old 移到 new 后：如果它用的是旧位置的默认键，就换成新位置的默认键
-    private func retargetDefaultKey(board b: Int, from old: Int, to new: Int) {
-        guard KeyNames.defaults.indices.contains(old), KeyNames.defaults.indices.contains(new),
-              var p = lib.boards[b].pads[new] else { return }
-        if p.keyCode == KeyNames.defaults[old].code {
-            p.keyCode = KeyNames.defaults[new].code
-            p.keyLabel = KeyNames.defaults[new].label
-            lib.boards[b].pads[new] = p
-        }
-    }
-
-    /// 同一页里只保留 keep 这一格使用它的键
-    private func clearDuplicateKeys(board b: Int, keep: Int) {
-        guard let code = lib.boards[b].pads[keep]?.keyCode else { return }
-        for j in 0..<padsPerBoard where j != keep && lib.boards[b].pads[j]?.keyCode == code {
-            lib.boards[b].pads[j]?.keyCode = nil
-            lib.boards[b].pads[j]?.keyLabel = nil
-        }
     }
 
     // MARK: 添加音频
@@ -600,7 +700,10 @@ final class Store: ObservableObject {
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.audio]
         panel.message = replace ? "选择新的音频文件" : "选择音频文件（可以多选）"
-        if panel.runModal() == .OK {
+        spaceKey.suspend()
+        let result = panel.runModal()
+        spaceKey.resume()
+        if result == .OK {
             addFiles(replace ? Array(panel.urls.prefix(1)) : panel.urls, at: i)
         }
     }
@@ -677,6 +780,10 @@ final class Store: ObservableObject {
                       keyLabel: used ? nil : def.label)
         }
         pad.duration = duration
+        if lib.boards[b].pads[i] == nil {
+            // 新格子：15 秒以内的短音效默认“从头重播”，连点就连响；较长的音乐默认“停止”
+            pad.mode = settings.defaultMode(forDuration: duration)
+        }
         if !pad.nameEdited { pad.name = src.deletingPathExtension().lastPathComponent }
         lib.boards[b].pads[i] = pad
         ensureLoaded(pad, force: true)
@@ -733,6 +840,23 @@ final class Store: ObservableObject {
         }
     }
 
+    /// 空格：Kanade 内部全局。编辑窗口里按设置决定是全部暂停，还是试听正在编辑的格子
+    func handleSpace() {
+        if prompt != nil { return }
+        if let target = editorTarget, settings.editorSpace == .previewCurrent {
+            let id = target.id
+            if engine.isPaused(id) {
+                resumePad(id)
+            } else if engine.isLive(id) {
+                stopPad(id)
+            } else {
+                triggerByID(id)
+            }
+            return
+        }
+        togglePauseAll()
+    }
+
     private func handleKey(_ e: NSEvent) -> Bool {
         if NSApp.modalWindow != nil { return false }
         if prompt != nil { return false }
@@ -745,22 +869,39 @@ final class Store: ObservableObject {
         if capturingPadID != nil {
             if e.keyCode == 53 { capturingPadID = nil; return true }
             if !mods.isEmpty { return false }
-            if Store.reserved.contains(e.keyCode) {
-                flash("这个键留给了全局操作，请换一个。")
-                return true
-            }
             setKey(e.keyCode, label: KeyNames.label(for: e))
             capturingPadID = nil
             return true
         }
 
-        if editorTarget != nil { return false }
-        if let r = NSApp.keyWindow?.firstResponder, r is NSText {
-            // 编辑模式下正在输入文字时不抢按键；演出模式下一律把按键交给按钮
-            if editing { return false }
-            NSApp.keyWindow?.makeFirstResponder(nil)
+        let key = NSApp.keyWindow
+        // 主窗口引用还没取到时，把不是弹出窗口的前台窗口当作主窗口
+        let inMain = key != nil && (mainWindow == nil ? key?.sheetParent == nil : key === mainWindow)
+        let inEditor = editorTarget != nil && key != nil && key?.sheetParent === mainWindow
+        if let r = key?.firstResponder, r is NSText {
+            // 正在输入文字时不抢按键（播放页里没有需要打字的地方，直接交给格子）
+            if !inMain || editing { return false }
+            key?.makeFirstResponder(nil)
         }
         if !mods.isEmpty { return false }
+
+        // 空格：快捷键注册失败时的后备处理
+        if e.keyCode == 49 && (inMain || inEditor) {
+            if !e.isARepeat { handleSpace() }
+            return true
+        }
+
+        if inEditor {
+            // 编辑窗口里：Esc 交给窗口（关闭），格子键照常播放
+            if e.keyCode == 53 { return false }
+            if let i = pads.firstIndex(where: { $0?.keyCode == e.keyCode }) {
+                if !e.isARepeat { trigger(index: i) }
+                return true
+            }
+            return false
+        }
+
+        guard inMain else { return false }
 
         switch e.keyCode {
         case 53: stopAll(hard: e.modifierFlags.contains(.shift)); return true
@@ -775,11 +916,6 @@ final class Store: ObservableObject {
 
         if let i = pads.firstIndex(where: { $0?.keyCode == e.keyCode }) {
             if !e.isARepeat { trigger(index: i) }
-            return true
-        }
-        // 空格没有分配给格子时：暂停 / 继续全部
-        if e.keyCode == 49 {
-            if !e.isARepeat { togglePauseAll() }
             return true
         }
         // 吞掉其他单键，避免系统提示音
@@ -901,7 +1037,10 @@ final class Store: ObservableObject {
         let pageName = boardName.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
         panel.nameFieldStringValue = currentPageOnly ? "Kanade-\(pageName)-\(date).zip" : "Kanade-备份-\(date).zip"
         panel.message = currentPageOnly ? "导出当前页（包含音频）" : "导出全部页面（包含音频）"
-        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        spaceKey.suspend()
+        let result = panel.runModal()
+        spaceKey.resume()
+        guard result == .OK, let dest = panel.url else { return }
 
         let manifest = BackupManifest(appVersion: appVersion, exported: Date(), boards: boards,
                                       midiGlobal: currentPageOnly ? nil : lib.midiGlobal)
@@ -964,7 +1103,10 @@ final class Store: ObservableObject {
         panel.allowedContentTypes = [.zip]
         panel.allowsMultipleSelection = false
         panel.message = "选择 Kanade 导出的备份文件（.zip）"
-        guard panel.runModal() == .OK, let src = panel.url else { return }
+        spaceKey.suspend()
+        let result = panel.runModal()
+        spaceKey.resume()
+        guard result == .OK, let src = panel.url else { return }
         let dir = audioDir
         flash("正在导入…")
         DispatchQueue.global(qos: .userInitiated).async {
@@ -979,6 +1121,7 @@ final class Store: ObservableObject {
                         return
                     }
                     self.lib.boards.append(contentsOf: boards)
+                    for b in self.lib.boards.indices { self.normalizeKeys(board: b) }
                     // 全局 MIDI 设置：只补上当前还没设置的项目
                     if let imported = midiGlobal {
                         var g = self.lib.midiGlobal ?? [:]

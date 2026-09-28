@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Kanade}",
+            "name": "Debug Kanade",
+            "target": "Kanade",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Kanade"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Kanade}",
+            "name": "Release Kanade",
+            "target": "Kanade",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Kanade"
+        }
+    ]
+}

@@ -149,6 +149,7 @@ final class AudioEngine {
             slots.append(s)
         }
         installMeter()
+        setLowLatencyBuffer()
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             self?.handleConfigChange()
@@ -168,12 +169,23 @@ final class AudioEngine {
         bands[2].filterType = .highShelf
         bands[2].frequency = 8000
         bands[2].bypass = false
-        s.eq.bypass = true
+        // 均衡器本身保持工作，用它的总增益实现放大；三个频段在关闭均衡时单独旁路
+        s.eq.bypass = false
+        for b in bands { b.bypass = true }
+        s.eq.globalGain = 0
         s.timePitch.bypass = true
         s.delay.bypass = true
         s.reverb.loadFactoryPreset(.mediumHall)
         s.reverbPreset = .mediumHall
         s.reverb.bypass = true
+    }
+
+    /// 把输出缓冲调小到 256 帧，缩短按下到出声的延迟（设备不支持时系统会自动取最接近的值）
+    private func setLowLatencyBuffer() {
+        guard let unit = engine.outputNode.audioUnit else { return }
+        var frames: UInt32 = 256
+        AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0,
+                             &frames, UInt32(MemoryLayout<UInt32>.size))
     }
 
     @discardableResult
@@ -364,8 +376,10 @@ final class AudioEngine {
         s.mixer.pan = Float(pad.pan)
         let fx = pad.fx
 
-        s.eq.bypass = !fx.eqOn
+        s.eq.bypass = false
+        s.eq.globalGain = Float(min(18, max(0, pad.gainDB)))
         let bands = s.eq.bands
+        for b in bands { b.bypass = !fx.eqOn }
         bands[0].gain = Float(fx.eqLow)
         bands[1].gain = Float(fx.eqMid)
         bands[2].gain = Float(fx.eqHigh)
@@ -499,7 +513,8 @@ final class AudioEngine {
         let slot = takeSlot()
         apply(pad, to: slot)
         let player = slot.player
-        player.stop()
+        // 播放器在上一次播放结束时已经复位；只有还在运行的才需要停一下
+        if player.isPlaying { player.stop() }
         player.volume = 1
         let voice = Voice(slot: slot, padID: pad.id, plan: plan,
                           speed: pad.fx.pitchOn ? max(0.1, pad.fx.speed) : 1)
@@ -646,7 +661,10 @@ final class AudioEngine {
     }
 
     private func finished(_ v: Voice) {
-        if voices[v.padID]?.contains(where: { $0 === v }) == true { remove(v) }
+        guard voices[v.padID]?.contains(where: { $0 === v }) == true else { return }
+        // 在播放结束时顺手复位播放器，下次按键就不用等这一步
+        if v.slot.voice === v { v.player.stop() }
+        remove(v)
     }
 
     func progress(_ id: UUID) -> VoiceProgress? {
@@ -687,6 +705,7 @@ final class AudioEngine {
         engine.stop()
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                              &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+        setLowLatencyBuffer()
         let hw = engine.outputNode.outputFormat(forBus: 0)
         if hw.sampleRate > 0, let f = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: 2) {
             engine.mainMixerNode.removeTap(onBus: 0)

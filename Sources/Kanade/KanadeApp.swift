@@ -23,6 +23,11 @@ struct KanadeApp: App {
                 .environmentObject(store)
         }
         .defaultSize(width: 1380, height: 800)
+
+        Settings {
+            SettingsView(settings: store.settings)
+                .environmentObject(store)
+        }
         .commands {
             CommandGroup(replacing: .newItem) { }
             CommandGroup(replacing: .importExport) {

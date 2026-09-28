@@ -136,11 +136,13 @@ struct Pad: Codable, Identifiable, Equatable {
     var pan: Double = 0
     var fx: FXSettings = FXSettings()
     var midi: MIDITrigger? = nil
+    /// 放大增益（dB），0 到 +18
+    var gainDB: Double = 0
 
     enum CodingKeys: String, CodingKey {
         case id, fileName, originalName, name, colorIndex, keyCode, keyLabel, volume, mode
         case loop, exclusive, fade, duration, nameEdited, tag, startTime, endTime
-        case loopStart, loopEnd, channelMode, pan, fx, midi
+        case loopStart, loopEnd, channelMode, pan, fx, midi, gainDB
     }
 
     /// 播放范围
@@ -182,6 +184,7 @@ extension Pad {
         pan = (try? c.decodeIfPresent(Double.self, forKey: .pan)) ?? 0
         fx = (try? c.decodeIfPresent(FXSettings.self, forKey: .fx)) ?? FXSettings()
         midi = try? c.decodeIfPresent(MIDITrigger.self, forKey: .midi)
+        gainDB = min(18, max(0, (try? c.decodeIfPresent(Double.self, forKey: .gainDB)) ?? 0))
     }
 }
 
@@ -189,6 +192,14 @@ struct Board: Codable, Identifiable, Equatable {
     var id: UUID = UUID()
     var name: String
     var pads: [Pad?] = Array(repeating: nil, count: padsPerBoard)
+}
+
+extension Board {
+    /// 没改过名字（空白，或者是“第 N 页”这种默认名）
+    var hasDefaultName: Bool {
+        let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty || t.range(of: #"^第\s*\d+\s*页$"#, options: .regularExpression) != nil
+    }
 }
 
 struct Library: Codable {

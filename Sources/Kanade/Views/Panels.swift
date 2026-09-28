@@ -13,6 +13,16 @@ struct PlaybackPanel: View {
                     ParamSlider("音量", value: b(\.volume, 1), range: 0...1, defaultValue: 1) {
                         "\(Int(($0 * 100).rounded()))%"
                     }
+                    ParamSlider("增益", value: b(\.gainDB, 0), range: 0...18, step: 0.5, defaultValue: 0) { v in
+                        v < 0.05 ? "0 dB" : String(format: "+%.1f dB", v)
+                    }
+                    HStack(spacing: 6) {
+                        Spacer().frame(width: 56)
+                        Button("自动增益") { store.autoGain(id: padID) }
+                            .help("把这个格子的峰值放大到 −1 dB")
+                        Button("恢复") { store.editPad(id: padID) { $0.gainDB = 0 } }
+                    }
+                    .controlSize(.small)
                     ParamSlider("淡出", value: b(\.fade, 0.3), range: 0...5, step: 0.1, defaultValue: 0.3) {
                         String(format: "%.1f 秒", $0)
                     }
@@ -67,16 +77,13 @@ struct PlaybackPanel: View {
                         .fixedSize()
                         .controlSize(.small)
                     }
-                    Row("快捷键") {
-                        KeyCap(text: pad.keyLabel ?? "无")
-                        Button(store.capturingPadID == padID ? "请按一个键…" : "设置") {
+                    Row("键位") {
+                        KeyCap(text: pad.keyLabel ?? "")
+                        Button(store.capturingPadID == padID ? "请按目标键…" : "移动…") {
                             store.beginKeyCapture(id: padID)
                         }
                         .controlSize(.small)
-                        if pad.keyCode != nil {
-                            Button("清除") { store.clearKey(id: padID) }
-                                .controlSize(.small)
-                        }
+                        .help("按下另一个格子的键，把这个音频移过去（两边互换）")
                     }
                     Row("MIDI") {
                         Text(pad.midi?.label ?? "无")
@@ -254,6 +261,15 @@ struct Inspector: View {
             Text("已用 \(store.usedCount) / \(padsPerBoard) 格")
                 .font(.app(11))
                 .foregroundColor(.secondary)
+            Menu("批量设置“再按一次”") {
+                Button("15 秒以内的格子设为“从头重播”") { store.setModeForBoard(.restart, shortOnly: true) }
+                Divider()
+                ForEach(PressMode.allCases) { m in
+                    Button("本页全部设为“\(m.label)”") { store.setModeForBoard(m, shortOnly: false) }
+                }
+            }
+            .controlSize(.small)
+            .fixedSize()
             HStack {
                 Button("导出这一页…") { store.exportBackup(currentPageOnly: true) }
                 Button("导入备份…") { store.importBackup() }
@@ -267,7 +283,7 @@ struct Inspector: View {
                 Text("点选一个按钮，在这里修改它的设置。")
                 Text("双击按钮打开波形与音效编辑，可以剪掉开头结尾、设置循环范围、加均衡和混响。")
                 Text("把音频文件拖到空格上即可添加，拖动按钮可以交换位置，键位跟着位置走。")
-                Text("更改快捷键时，音乐会移到新键对应的格子，原来在那里的音乐换过来。")
+                Text("键位固定在格子上。“移动…”会把音频移到另一个键的格子，原来在那里的音频换过来。")
                 Text("任何模式下都可以右键点按钮，快速改颜色、标签和声道，或者用“MIDI 学习”绑定 MIDI 设备。")
                 Text("格子是灰色虚线框时表示还在载入，变成彩色就可以播放了。")
                 Text("有多个页面时，Tab 切到下一页，Shift+Tab 切到上一页。")

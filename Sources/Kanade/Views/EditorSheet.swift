@@ -6,6 +6,10 @@ struct PadEditorSheet: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) private var dismiss
     let padID: UUID
+    /// 双击名称进入修改；平时是普通文字，打开窗口时不会自动进入改名
+    @State private var editingName = false
+    @State private var draftName = ""
+    @FocusState private var nameFocused: Bool
 
     var body: some View {
         let _ = store.liveTick
@@ -35,6 +39,33 @@ struct PadEditorSheet: View {
         }
         .frame(width: 940, height: 760)
         .font(.app(13))
+        .onDisappear {
+            if editingName { commitName() }
+        }
+    }
+
+    private func beginName(_ pad: Pad) {
+        draftName = pad.name
+        editingName = true
+        store.spaceKey.suspend()          // 输入时让空格能正常打出来
+        DispatchQueue.main.async { nameFocused = true }
+    }
+
+    private func commitName() {
+        guard editingName else { return }
+        editingName = false
+        store.spaceKey.resume()
+        let text = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        store.editPad(id: padID) {
+            $0.name = text
+            $0.nameEdited = true
+        }
+    }
+
+    private func cancelName() {
+        guard editingName else { return }
+        editingName = false
+        store.spaceKey.resume()
     }
 
     private func header(_ pad: Pad) -> some View {
@@ -43,9 +74,31 @@ struct PadEditorSheet: View {
                 .fill(padColor(pad.colorIndex))
                 .frame(width: 6, height: 36)
             VStack(alignment: .leading, spacing: 2) {
-                TextField("名称", text: store.padNameBinding(id: padID))
-                    .textFieldStyle(.plain)
-                    .font(.app(19, .semibold))
+                if editingName {
+                    TextField("名称", text: $draftName)
+                        .textFieldStyle(.plain)
+                        .font(.app(19, .semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .fill(Color(nsColor: .textBackgroundColor)))
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.accentColor, lineWidth: 1.5))
+                        .frame(maxWidth: 420)
+                        .focused($nameFocused)
+                        .onSubmit { commitName() }
+                        .onExitCommand { cancelName() }
+                        .onChange(of: nameFocused) { focused in
+                            if !focused { commitName() }
+                        }
+                } else {
+                    Text(pad.displayName)
+                        .font(.app(19, .semibold))
+                        .lineLimit(1)
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) { beginName(pad) }
+                        .help("双击修改名称")
+                }
                 Text("\(pad.originalName)，全长 \(formatPrecise(pad.duration))")
                     .font(.app(11))
                     .foregroundColor(.secondary)
@@ -59,9 +112,12 @@ struct PadEditorSheet: View {
                     KeyCap(text: k)
                 }
             }
-            Button("完成") { dismiss() }
-                .keyboardShortcut(.cancelAction)
-                .controlSize(.large)
+            Button("完成") {
+                if editingName { commitName() }
+                dismiss()
+            }
+            .keyboardShortcut(editingName ? nil : .cancelAction)
+            .controlSize(.large)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
@@ -248,9 +304,9 @@ struct WaveformEditor: View {
                         )
                 }
                 .frame(height: 250)
-                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white))
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color(nsColor: .textBackgroundColor)))
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.black.opacity(0.15)))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(Color.primary.opacity(0.15)))
 
                 HStack(spacing: 10) {
                     overview(pad, m)
@@ -329,21 +385,23 @@ struct WaveformEditor: View {
     }
 
     private func zoomControls(_ m: Markers) -> some View {
-        HStack(spacing: 4) {
-            Button { vp.zoomCentered(by: 1 / 1.6) } label: { Image(systemName: "minus.magnifyingglass") }
-                .keyboardShortcut("-", modifiers: .command)
-                .help("缩小（⌘-）")
+        HStack(spacing: 6) {
             Text(zoomText)
                 .font(.app(11, .medium).monospacedDigit())
+                .foregroundColor(.secondary)
                 .frame(width: 50)
-            Button { vp.zoomCentered(by: 1.6) } label: { Image(systemName: "plus.magnifyingglass") }
-                .keyboardShortcut("=", modifiers: .command)
-                .help("放大（⌘=）")
-            Button("看选区") { vp.show(from: m.start, to: m.end) }
-                .help("放大到播放范围")
             Button("看全部") { vp.fit() }
                 .keyboardShortcut("0", modifiers: .command)
                 .help("显示整段（⌘0）")
+            // 保留 ⌘= / ⌘- 快捷键，不显示按钮
+            Button("") { vp.zoomCentered(by: 1.6) }
+                .keyboardShortcut("=", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+            Button("") { vp.zoomCentered(by: 1 / 1.6) }
+                .keyboardShortcut("-", modifiers: .command)
+                .frame(width: 0, height: 0)
+                .opacity(0)
         }
         .controlSize(.small)
     }
@@ -380,9 +438,9 @@ struct WaveformEditor: View {
             )
         }
         .frame(height: 34)
-        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.white))
+        .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color(nsColor: .textBackgroundColor)))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.black.opacity(0.15)))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.15)))
         .opacity(vp.zoom > 1.001 ? 1 : 0.55)
         .help("拖动蓝框移动视图")
     }
@@ -547,7 +605,7 @@ struct WaveformEditor: View {
         func x(_ t: Double) -> CGFloat { CGFloat((t - viewStart) / span) * w }
 
         // 标尺：刻度随缩放自动变细，最细到 1 毫秒
-        ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: rulerH)), with: .color(Color.black.opacity(0.04)))
+        ctx.fill(Path(CGRect(x: 0, y: 0, width: w, height: rulerH)), with: .color(Color.primary.opacity(0.04)))
         let pps = Double(w) / span
         let steps: [Double] = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5,
                                1, 2, 5, 10, 15, 30, 60, 120, 300, 600]
@@ -556,10 +614,10 @@ struct WaveformEditor: View {
         var ticks = 0
         while t <= viewEnd + 1e-9 && ticks < 400 {
             let xx = x(t)
-            ctx.fill(Path(CGRect(x: xx, y: rulerH - 6, width: 1, height: 6)), with: .color(Color.black.opacity(0.35)))
+            ctx.fill(Path(CGRect(x: xx, y: rulerH - 6, width: 1, height: 6)), with: .color(Color.primary.opacity(0.35)))
             let text = step < 1 ? formatPrecise(t) : formatTime(t)
             ctx.draw(Text(text).font(.app(9, .medium).monospacedDigit())
-                        .foregroundColor(Color.black.opacity(0.55)),
+                        .foregroundColor(Color.primary.opacity(0.55)),
                      at: CGPoint(x: xx + 3, y: 8), anchor: .leading)
             t += step
             ticks += 1
@@ -589,7 +647,7 @@ struct WaveformEditor: View {
                 let p = data[min(lane, chs - 1)]
                 let mid = laneTop + laneH * (CGFloat(lane) + 0.5)
                 let scale = laneH * 0.47
-                ctx.fill(Path(CGRect(x: 0, y: mid, width: w, height: 0.5)), with: .color(Color.black.opacity(0.12)))
+                ctx.fill(Path(CGRect(x: 0, y: mid, width: w, height: 0.5)), with: .color(Color.primary.opacity(0.12)))
 
                 if samplesPerPixel < 1.5 {
                     // 放得很大时直接画出每一个采样点连成的线
@@ -644,12 +702,12 @@ struct WaveformEditor: View {
                     }
                 }
             }
-            ctx.draw(Text("L").font(.app(10, .bold)).foregroundColor(Color.black.opacity(0.45)),
+            ctx.draw(Text("L").font(.app(10, .bold)).foregroundColor(Color.primary.opacity(0.45)),
                      at: CGPoint(x: 8, y: laneTop + 10), anchor: .leading)
-            ctx.draw(Text("R").font(.app(10, .bold)).foregroundColor(Color.black.opacity(0.45)),
+            ctx.draw(Text("R").font(.app(10, .bold)).foregroundColor(Color.primary.opacity(0.45)),
                      at: CGPoint(x: 8, y: laneTop + laneH + 10), anchor: .leading)
         } else {
-            ctx.draw(Text("载入中…").font(.app(12)).foregroundColor(Color.black.opacity(0.5)),
+            ctx.draw(Text("载入中…").font(.app(12)).foregroundColor(Color.primary.opacity(0.5)),
                      at: CGPoint(x: w / 2, y: h / 2), anchor: .center)
         }
 
@@ -657,15 +715,15 @@ struct WaveformEditor: View {
         let xs = min(max(x(m.start), 0), w)
         let xe = min(max(x(m.end), 0), w)
         if xs > 0 {
-            ctx.fill(Path(CGRect(x: 0, y: rulerH, width: xs, height: h - rulerH)), with: .color(Color(white: 0.9).opacity(0.72)))
+            ctx.fill(Path(CGRect(x: 0, y: rulerH, width: xs, height: h - rulerH)), with: .color(Color(nsColor: .textBackgroundColor).opacity(0.72)))
         }
         if xe < w {
-            ctx.fill(Path(CGRect(x: xe, y: rulerH, width: w - xe, height: h - rulerH)), with: .color(Color(white: 0.9).opacity(0.72)))
+            ctx.fill(Path(CGRect(x: xe, y: rulerH, width: w - xe, height: h - rulerH)), with: .color(Color(nsColor: .textBackgroundColor).opacity(0.72)))
         }
 
         // 播放头
         if let pos = position, pos >= viewStart, pos <= viewEnd {
-            ctx.fill(Path(CGRect(x: x(pos) - 0.75, y: 0, width: 1.5, height: h)), with: .color(Color.black.opacity(0.85)))
+            ctx.fill(Path(CGRect(x: x(pos) - 0.75, y: 0, width: 1.5, height: h)), with: .color(Color.primary.opacity(0.85)))
         }
     }
 }
