@@ -127,13 +127,21 @@ final class AudioEngine {
 
     var onChange: (() -> Void)?
     var onMeter: ((Float, Float) -> Void)?
+    /// 开始 / 结束恢复音频输出时通知界面
+    var onRecoverStart: (() -> Void)?
+    var onRecoverEnd: ((Bool) -> Void)?
+    private var recovering = false
+    private var pendingPlay: (pad: Pad, time: TimeInterval)?
     var master: Double = 0.9 {
         didSet { engine.mainMixerNode.outputVolume = Float(master) }
     }
 
+    /// 所有接触声音硬件的操作都放在这个队列里，避免开机或唤醒后设备响应慢时卡住界面
+    private let control = DispatchQueue(label: "kanade.audio.control", qos: .userInitiated)
+
     init() {
-        let sr = engine.outputNode.outputFormat(forBus: 0).sampleRate
-        chainFormat = AVAudioFormat(standardFormatWithSampleRate: sr > 0 ? sr : 48000, channels: 2)!
+        // 内部统一用 48 kHz，启动时不去查询硬件（和设备采样率不同时由混音器自动转换）
+        chainFormat = AVAudioFormat(standardFormatWithSampleRate: 48000, channels: 2)!
         let main = engine.mainMixerNode
         main.outputVolume = 0.9
         for _ in 0..<Self.slotCount {
@@ -149,13 +157,109 @@ final class AudioEngine {
             slots.append(s)
         }
         installMeter()
-        setLowLatencyBuffer()
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: .main) { [weak self] _ in
             self?.handleConfigChange()
         }
-        start()
+        // 这里不启动引擎：由 boot() 在后台完成
     }
+
+    /// 在后台查询输出设备、切换到保存的设备并启动引擎，完成后回到主线程
+    func boot(deviceUID: String?, completion: @escaping (_ devices: [OutputDevice], _ ok: Bool) -> Void) {
+        control.async {
+            Log.step("查询声音输出设备")
+            let list = AudioDevices.outputs()
+            Log.write("找到 \(list.count) 个输出设备")
+            if let uid = deviceUID, let d = list.first(where: { $0.uid == uid }) {
+                Log.step("切换到保存的输出设备：\(d.name)")
+                self.applyDevice(d.deviceID)
+            }
+            self.reconnectOutput()
+            Log.step("启动音频引擎")
+            let ok = self.startNow()
+            Log.step(ok ? "音频引擎已启动" : "音频引擎启动失败")
+            DispatchQueue.main.async {
+                completion(list, ok)
+                self.onChange?()
+            }
+        }
+    }
+
+    /// 只在 control 队列里调用
+    private func startNow() -> Bool {
+        if engine.isRunning { return true }
+        engine.prepare()
+        do {
+            try engine.start()
+            return true
+        } catch {
+            Log.write("音频引擎启动出错：\(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// 只在 control 队列里调用：切换输出设备并重新连接
+    private func applyDevice(_ id: AudioDeviceID) {
+        guard let unit = engine.outputNode.audioUnit else { return }
+        var dev = id
+        engine.stop()
+        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
+                             &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+        reconnectOutput()
+    }
+
+    /// 只在 control 队列里调用：按输出设备“当前”的格式重新连接总混音器和输出
+    /// （设备唤醒或重新配置后，旧的连接格式可能已经不对，会导致有播放显示但没声音）
+    private func reconnectOutput() {
+        let hw = engine.outputNode.outputFormat(forBus: 0)
+        Log.write(String(format: "输出设备格式：%.0f Hz，%d 声道", hw.sampleRate, Int(hw.channelCount)))
+        guard hw.sampleRate > 0,
+              let f = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: 2) else { return }
+        engine.mainMixerNode.removeTap(onBus: 0)
+        engine.connect(engine.mainMixerNode, to: engine.outputNode, format: f)
+        installMeter()
+    }
+
+    /// 只在 control 队列里调用：停止、重新连接、再启动
+    private func rebuildAndStart() -> Bool {
+        engine.stop()
+        reconnectOutput()
+        return startNow()
+    }
+
+    /// 在后台恢复音频输出（不会卡住界面）。完成后补播 2 秒内按下的格子
+    func recoverOutput(then pad: Pad? = nil) {
+        if let pad { pendingPlay = (pad, ProcessInfo.processInfo.systemUptime) }
+        guard !recovering else { return }
+        recovering = true
+        for s in slots {
+            s.player.stop()
+            s.voice = nil
+        }
+        voices.removeAll()
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        onRecoverStart?()
+        Log.step("开始恢复音频输出")
+        control.async {
+            let ok = self.rebuildAndStart()
+            DispatchQueue.main.async {
+                self.recovering = false
+                Log.step(ok ? "音频输出恢复成功" : "音频输出恢复失败")
+                self.onRecoverEnd?(ok)
+                if ok, let p = self.pendingPlay,
+                   ProcessInfo.processInfo.systemUptime - p.time < 2 {
+                    self.pendingPlay = nil
+                    _ = self.trigger(p.pad)
+                }
+                self.pendingPlay = nil
+                self.onChange?()
+            }
+        }
+    }
+
+    var isRecovering: Bool { recovering }
+    var isRunning: Bool { engine.isRunning }
 
     private func configure(_ s: Slot) {
         let bands = s.eq.bands
@@ -180,24 +284,11 @@ final class AudioEngine {
         s.reverb.bypass = true
     }
 
-    /// 把输出缓冲调小到 256 帧，缩短按下到出声的延迟（设备不支持时系统会自动取最接近的值）
-    private func setLowLatencyBuffer() {
-        guard let unit = engine.outputNode.audioUnit else { return }
-        var frames: UInt32 = 256
-        AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0,
-                             &frames, UInt32(MemoryLayout<UInt32>.size))
-    }
-
-    @discardableResult
-    func start() -> Bool {
-        if engine.isRunning { return true }
-        engine.prepare()
-        do {
-            try engine.start()
-            return true
-        } catch {
-            return false
-        }
+    /// 引擎是否可以直接播放；没在运行时在后台恢复，并返回 false（不会卡住界面）
+    private func ensureRunning(then pad: Pad?) -> Bool {
+        if engine.isRunning && !recovering { return true }
+        recoverOutput(then: pad)
+        return false
     }
 
     private func installMeter() {
@@ -222,6 +313,7 @@ final class AudioEngine {
     }
 
     private func handleConfigChange() {
+        Log.write("音频设备配置发生变化，重新启动音频引擎")
         for s in slots {
             s.player.stop()
             s.voice = nil
@@ -229,7 +321,11 @@ final class AudioEngine {
         voices.removeAll()
         fadeTimer?.invalidate()
         fadeTimer = nil
-        start()
+        control.async {
+            let ok = self.rebuildAndStart()
+            Log.write(ok ? "音频引擎已重新启动" : "音频引擎重新启动失败")
+            DispatchQueue.main.async { self.onChange?() }
+        }
         onChange?()
     }
 
@@ -299,6 +395,10 @@ final class AudioEngine {
                 self.plans[id] = nil
                 self.onChange?()
                 completion(true)
+                if self.loadingMode.isEmpty {
+                    Log.step(String(format: "音频全部载入完成：%d 个，占用约 %.0f MB",
+                                    self.audio.count, Double(self.loadedBytes) / 1_048_576))
+                }
             }
         }
         op.queuePriority = priority
@@ -435,7 +535,7 @@ final class AudioEngine {
     @discardableResult
     func trigger(_ pad: Pad) -> Bool {
         guard let a = audio[pad.id] else { return true }
-        guard start() else { return false }
+        guard ensureRunning(then: pad) else { return true }
         if isPaused(pad.id) {
             if pad.mode == .restart {
                 stop(pad.id, fade: 0)
@@ -477,7 +577,7 @@ final class AudioEngine {
 
     /// 从指定位置试听到播放范围结尾
     func preview(_ pad: Pad, from t: Double) {
-        guard let a = audio[pad.id], start() else { return }
+        guard let a = audio[pad.id], ensureRunning(then: nil) else { return }
         for v in voices[pad.id] ?? [] where !v.stopping { beginFade(v, 0.03) }
         let end = pad.regionEnd
         guard end - t > 0.02 else { return }
@@ -577,7 +677,7 @@ final class AudioEngine {
     }
 
     func resume(_ id: UUID) {
-        guard start() else { return }
+        guard ensureRunning(then: nil) else { return }
         let now = ProcessInfo.processInfo.systemUptime
         for v in voices[id] ?? [] where !v.stopping && v.paused {
             v.paused = false
@@ -681,7 +781,7 @@ final class AudioEngine {
                 pos = key.loopIn + (el - plan.introLength).truncatingRemainder(dividingBy: plan.loopLength)
             }
             return VoiceProgress(position: pos, fraction: (pos - key.start) / span,
-                                 remaining: nil, looping: true, fading: v.stopping)
+                                 remaining: max(0, key.loopOut - pos) / v.speed, looping: true, fading: v.stopping)
         }
         let pos = min(key.start + el, key.end)
         return VoiceProgress(position: pos, fraction: (pos - key.start) / span,
@@ -698,21 +798,17 @@ final class AudioEngine {
 
     // MARK: 输出设备
 
+    /// 用户在菜单里切换输出设备时调用（主线程）
     func setOutputDevice(_ deviceID: AudioDeviceID?) {
-        guard var dev = deviceID ?? AudioDevices.defaultOutputID(),
-              let unit = engine.outputNode.audioUnit else { return }
         for id in Array(voices.keys) { hardStop(id) }
-        engine.stop()
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
-                             &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
-        setLowLatencyBuffer()
-        let hw = engine.outputNode.outputFormat(forBus: 0)
-        if hw.sampleRate > 0, let f = AVAudioFormat(standardFormatWithSampleRate: hw.sampleRate, channels: 2) {
-            engine.mainMixerNode.removeTap(onBus: 0)
-            engine.connect(engine.mainMixerNode, to: engine.outputNode, format: f)
-            installMeter()
+        control.async {
+            guard let dev = deviceID ?? AudioDevices.defaultOutputID() else { return }
+            Log.step("切换输出设备")
+            self.applyDevice(dev)
+            let ok = self.startNow()
+            Log.step(ok ? "输出设备切换完成" : "输出设备切换后引擎启动失败")
+            DispatchQueue.main.async { self.onChange?() }
         }
-        start()
         onChange?()
     }
 }

@@ -55,6 +55,8 @@ struct KanadeApp: App {
                 Button("全部停止（淡出）") { store.stopAll(hard: false) }
                 Button("全部立即停止") { store.stopAll(hard: true) }
                 Divider()
+                Button("重新启动音频输出") { store.restartAudioOutput() }
+                Divider()
                 Button("上一页（⇧Tab 或 [）") { store.switchBoard(by: -1) }
                 Button("下一页（Tab 或 ]）") { store.switchBoard(by: 1) }
                 Button("新建页面") { store.addBoard() }

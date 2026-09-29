@@ -221,7 +221,7 @@ struct PadFace: View {
     private var badges: some View {
         HStack(spacing: 3) {
             if pad.loop { Image(systemName: "repeat") }
-            if pad.mode == .pause { Image(systemName: "playpause") }
+            if pad.mode != .toggle { Image(systemName: pad.mode.icon) }
             if pad.exclusive { Image(systemName: "1.circle") }
             if pad.isTrimmed { Image(systemName: "scissors") }
             if pad.fx.anyOn { Image(systemName: "wand.and.stars") }
@@ -397,9 +397,11 @@ struct PadMenu: View {
             }
             Menu("正在播放时再按一次") {
                 ForEach(PressMode.allCases) { m in
-                    Toggle(m.label, isOn: Binding(
+                    Toggle(isOn: Binding(
                         get: { pad.mode == m },
-                        set: { _ in store.editPad(id: id) { $0.mode = m } }))
+                        set: { _ in store.editPad(id: id) { $0.mode = m } })) {
+                        Label(m.label, systemImage: m.icon)
+                    }
                 }
             }
             Toggle("循环播放", isOn: store.padBinding(id: id, \.loop, fallback: false))

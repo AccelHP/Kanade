@@ -100,7 +100,7 @@ final class AppSettings: ObservableObject {
         editorSpace = EditorSpaceAction(rawValue: d.string(forKey: "editorSpace") ?? "") ?? .pauseAll
         editorAutoPlay = d.object(forKey: "editorAutoPlay") as? Bool ?? false
         stopFade = d.object(forKey: "stopFade") as? Double ?? 0.4
-        newPadMode = NewPadModeRule(rawValue: d.string(forKey: "newPadMode") ?? "") ?? .byDuration
+        newPadMode = NewPadModeRule(rawValue: d.string(forKey: "newPadMode") ?? "") ?? .allStop
         shortThreshold = d.object(forKey: "shortThreshold") as? Double ?? 15
         clipHold = ClipHoldMode(rawValue: d.string(forKey: "clipHold") ?? "") ?? .manual
         showWaveform = d.object(forKey: "showWaveform") as? Bool ?? true
@@ -130,7 +130,7 @@ final class AppSettings: ObservableObject {
         editorSpace = .pauseAll
         editorAutoPlay = false
         stopFade = 0.4
-        newPadMode = .byDuration
+        newPadMode = .allStop
         shortThreshold = 15
         clipHold = .manual
         showWaveform = true
@@ -180,9 +180,9 @@ struct SettingsView: View {
                         .monospacedDigit()
                         .frame(width: 52, alignment: .trailing)
                 }
-                Picker("新加入音频的“再按一次”", selection: $settings.newPadMode) {
-                    ForEach(NewPadModeRule.allCases) { Text($0.label).tag($0) }
-                }
+                Toggle("短音效加入时默认“从头重播”", isOn: Binding(
+                    get: { settings.newPadMode == .byDuration },
+                    set: { settings.newPadMode = $0 ? .byDuration : .allStop }))
                 if settings.newPadMode == .byDuration {
                     HStack {
                         Text("短音效的时长界限")
@@ -191,19 +191,16 @@ struct SettingsView: View {
                             .monospacedDigit()
                             .frame(width: 52, alignment: .trailing)
                     }
-                    Text("短于界限的音频默认“从头重播”，其余默认“停止”。只影响之后新加入的音频。")
-                        .font(.app(11))
-                        .foregroundColor(.secondary)
                 }
+                Text("关闭时，新加入的音频一律默认“停止”。只影响之后新加入的音频。")
+                    .font(.app(11))
+                    .foregroundColor(.secondary)
             }
 
             Section("电平表") {
                 Picker("过载指示", selection: $settings.clipHold) {
                     ForEach(ClipHoldMode.allCases) { Text($0.label).tag($0) }
                 }
-                Text("“保持到手动复位”是专业设备的常见做法：削波往往只有几毫秒，灯一直亮着才不会错过。")
-                    .font(.app(11))
-                    .foregroundColor(.secondary)
             }
 
             Section {
@@ -215,7 +212,6 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .font(.app(13))
-        .frame(width: 520)
-        .fixedSize(horizontal: false, vertical: true)
+        .frame(width: 540, height: 660)
     }
 }

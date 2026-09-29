@@ -99,7 +99,9 @@ final class Store: ObservableObject {
 
     let meter = MeterModel()
     let engine = AudioEngine()
-    let midi = MIDIManager()
+    /// MIDI 在后台创建（开机后 MIDI 服务可能响应很慢）
+    private(set) var midi: MIDIManager?
+    private let watchdog = MainThreadWatchdog()
     let settings = AppSettings()
     let spaceKey = SpaceHotKey()
     /// 主窗口（用来判断按键发生在哪个窗口）
@@ -123,6 +125,9 @@ final class Store: ObservableObject {
     private static let passthrough: Set<UInt16> = [48, 36, 49, 51, 123, 124, 125, 126]
 
     init() {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        Log.write("========== Kanade \(version) 启动，macOS \(ProcessInfo.processInfo.operatingSystemVersionString) ==========")
+        Log.step("读取页面设置")
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Kanade", isDirectory: true)
         audioDir = base.appendingPathComponent("Audio", isDirectory: true)
@@ -156,25 +161,28 @@ final class Store: ObservableObject {
 
         engine.master = loaded.master
         // 一次操作里的多次状态变化合并成一次界面刷新
-        engine.onChange = { [weak self] in
-            guard let self, !self.tickPending else { return }
-            self.tickPending = true
-            DispatchQueue.main.async {
-                self.tickPending = false
-                self.liveTick &+= 1
-            }
+        engine.onChange = { [weak self] in self?.requestRefresh() }
+        engine.onRecoverStart = { [weak self] in
+            self?.flash("正在恢复音频输出，稍等一下…")
+        }
+        engine.onRecoverEnd = { [weak self] ok in
+            self?.flash(ok ? "音频输出已恢复。" : "音频输出恢复失败，请检查输出设备，或者在“播放”菜单里重新启动音频输出。")
         }
         let meterRef = meter
         engine.onMeter = { l, r in meterRef.update(l, r) }
 
-        devices = AudioDevices.outputs()
-        if let uid = loaded.outputDeviceUID {
-            if let d = devices.first(where: { $0.uid == uid }) {
-                engine.setOutputDevice(d.deviceID)
-            } else {
-                lib.outputDeviceUID = nil
+        // 声音设备和引擎在后台准备，界面不用等
+        let savedUID = loaded.outputDeviceUID
+        engine.boot(deviceUID: savedUID) { [weak self] list, ok in
+            guard let self else { return }
+            self.devices = list
+            if let uid = savedUID, !list.contains(where: { $0.uid == uid }) {
+                self.lib.outputDeviceUID = nil
+                self.flash("之前选的输出设备不在了，已改回系统默认。")
             }
+            if !ok { self.flash("音频输出暂时无法启动，按下格子时会再试一次。") }
         }
+        Log.step("开始载入音频：共 \(loaded.boards.reduce(0) { $0 + $1.pads.compactMap { $0 }.count }) 个")
         loadBoards()
 
         // 键位固定在格子上：旧数据里的自定义键、被清除的键一律恢复成所在位置的默认键
@@ -203,15 +211,49 @@ final class Store: ObservableObject {
         }
         if NSApp.isActive { spaceKey.setActive(true) }
 
-        midi.onMessage = { [weak self] m in self?.handleMIDI(m) }
-        midi.onSourcesChanged = { [weak self] in self?.midiSources = self?.midi.sourceNames ?? [] }
-        midiSources = midi.sourceNames
+        // MIDI 在后台创建
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            Log.step("初始化 MIDI")
+            let m = MIDIManager()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.midi = m
+                m.onMessage = { [weak self] msg in self?.handleMIDI(msg) }
+                m.onSourcesChanged = { [weak self] in self?.midiSources = self?.midi?.sourceNames ?? [] }
+                self.midiSources = m.sourceNames
+                Log.step("MIDI 初始化完成：\(m.sourceNames.count) 个设备")
+            }
+        }
+
+        // 记录睡眠唤醒，方便排查唤醒后的问题
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
+                                                          object: nil, queue: .main) { [weak self] _ in
+            Log.write("系统从睡眠中唤醒")
+            // 唤醒后声音设备可能已经重新配置：没有声音在播放时，提前在后台重建音频输出
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                guard let self, self.engine.voices.isEmpty else { return }
+                Log.write("唤醒后主动重建音频输出")
+                self.engine.recoverOutput()
+            }
+        }
+        watchdog.start()
+        Log.step("界面准备完成")
 
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             self?.saveNow()
         }
         if missing > 0 { flash("有 \(missing) 个音频文件找不到了，对应的按钮已清空。") }
+    }
+
+    /// 合并刷新：同一时刻的多次状态变化只刷新一次界面
+    func requestRefresh() {
+        guard !tickPending else { return }
+        tickPending = true
+        DispatchQueue.main.async {
+            self.tickPending = false
+            self.liveTick &+= 1
+        }
     }
 
     // MARK: 读取
@@ -313,8 +355,9 @@ final class Store: ObservableObject {
                 self.enforceMemoryBudget()
             } else {
                 self.flash("无法载入“\(p.displayName)”。")
+                Log.write("音频载入失败：\(p.fileName)")
             }
-            self.liveTick &+= 1
+            self.requestRefresh()
         }
     }
 
@@ -377,6 +420,12 @@ final class Store: ObservableObject {
     }
 
     func togglePauseAll() { engine.togglePauseAll() }
+
+    /// 菜单里的“重新启动音频输出”：遇到有播放显示但没声音时手动恢复
+    func restartAudioOutput() {
+        Log.write("手动重新启动音频输出")
+        engine.recoverOutput()
+    }
     func pausePad(_ id: UUID) { engine.pause(id) }
     func resumePad(_ id: UUID) { engine.resume(id) }
 
@@ -413,7 +462,14 @@ final class Store: ObservableObject {
     }
 
     func refreshDevices() {
-        devices = AudioDevices.outputs()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let list = AudioDevices.outputs()
+            DispatchQueue.main.async { self?.applyDeviceList(list) }
+        }
+    }
+
+    private func applyDeviceList(_ list: [OutputDevice]) {
+        devices = list
         if let uid = lib.outputDeviceUID, !devices.contains(where: { $0.uid == uid }) {
             setDevice(nil)
             flash("之前选的输出设备不在了，已改回系统默认。")

@@ -28,7 +28,7 @@ struct PlaybackPanel: View {
                     }
                     Row("再按一次") {
                         Picker("", selection: b(\.mode, .toggle)) {
-                            ForEach(PressMode.allCases) { m in Text(m.label).tag(m) }
+                            ForEach(PressMode.allCases) { m in Label(m.label, systemImage: m.icon).tag(m) }
                         }
                         .labelsHidden()
                         .controlSize(.small)

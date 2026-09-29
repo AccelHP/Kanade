@@ -8,7 +8,7 @@ set -euo pipefail
 BUNDLE_ID="io.github.accelhp.kanade"
 # 版本号（显示给用户看的）和内部编号（每次发布加 1）
 VERSION="3.4"
-BUILD_NUMBER="21"
+BUILD_NUMBER="24"
 # 左上角 logo 的字体，可选：
 #   Quicksand  Nunito  Comfortaa  Zen Maru Gothic
 #   Outfit  Urbanist  Sora  Lexend  Poppins  Montserrat

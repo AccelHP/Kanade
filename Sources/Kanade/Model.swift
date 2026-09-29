@@ -16,6 +16,14 @@ enum PressMode: String, Codable, CaseIterable, Identifiable {
         case .overlap: return "叠加再播一遍"
         }
     }
+    var icon: String {
+        switch self {
+        case .toggle: return "stop.fill"
+        case .pause: return "playpause.fill"
+        case .restart: return "arrow.counterclockwise"
+        case .overlap: return "square.on.square"
+        }
+    }
 }
 
 enum ChannelMode: String, Codable, CaseIterable, Identifiable {
